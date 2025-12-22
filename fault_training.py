@@ -27,7 +27,7 @@ EPS_DECAY = 0.999
 
 SHOW_EVERY = 200
 SHOW_LAST = 50
-EXPLORATION_STEPS = 5000
+EXPLORATION_STEPS = 500
 
 LEARNING_RATE = 0.1
 DISCOUNT = 0.95
@@ -47,14 +47,14 @@ MAX_TIMESTEPS_PER_EPISODE = 400
 # Reward component weights
 # ---------------------------
 W_MOVE = 1.0
-W_DIRECTION = 20.0
-W_FAULT = 60.0
-W_CONGESTION = 5.0
+W_DIRECTION = 1.0
+W_FAULT = 1.0
+W_CONGESTION = 1.0
 
 BLOCKED_INCREASES_CONGESTION = True
 
 # congestion controls
-RESET_CONGESTION_EACH_EPISODE = False   # set True to fully reset each episode (Quick Fix A)
+RESET_CONGESTION_EACH_EPISODE = True   # set True to fully reset each episode (Quick Fix A)
 CONGESTION_DECAY = 0.90                 # keep 0.0..1.0; lower => faster forgetting (Fix B)
 USE_DECAY = True                        # set True to apply decay each episode
 MAX_NODE_VISIT_CAP = 100                # cap contribution per node (Fix C)
@@ -557,7 +557,7 @@ for episode in range(HM_EPISODES):
             for fn in faulty_nodes:
                 fx, fy = fn
                 # env uses [row=y][col=x] indexing like your original code
-                if 0 <= fy + (SIZE - 1) < SIZE*1 and 0 <= fx + (SIZE - 1) < SIZE*1:
+                if 0 <= fy < SIZE*1 and 0 <= fx < SIZE*1:
                     # coordinates are already in range -SIZE+1..SIZE-1; we index by offsetting to 0..SIZE-1
                     pass
             # Because your original env indexing used directly end_node.y/end_node.x, here coordinates
@@ -568,18 +568,21 @@ for episode in range(HM_EPISODES):
                 return (y + SIZE - 1, x + SIZE - 1)  # row, col
 
             for fn in faulty_nodes:
-                r, c = idx(fn)
+                # r, c = idx(fn)
+                r, c = fn
                 if 0 <= r < SIZE and 0 <= c < SIZE:
                     env[r][c] = (0, 0, 255)  # red for faulty nodes
 
             # mark active packets
             for pkt in active_packets:
-                r, c = idx(pkt.pos)
+                # r, c = idx(pkt.pos)
+                r, c = pkt.pos
                 if 0 <= r < SIZE and 0 <= c < SIZE:
                     env[r][c] = COLOR_MAP[1]  # orange
 
             # optionally mark rep_dest
-            r, c = idx(rep_dest)
+            # r, c = idx(rep_dest)
+            r, c = rep_dest
             if 0 <= r < SIZE and 0 <= c < SIZE:
                 env[r][c] = COLOR_MAP[2]
 
