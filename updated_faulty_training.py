@@ -9,8 +9,8 @@ from environment import Node    # assumes Node.action(action) updates node.x,nod
 # -------------------------
 # Environment / grid config
 # -------------------------
-GRID_W = GRID_H = 4          # 4x4 grid
-NUM_NODES = GRID_W * GRID_H  # 16
+GRID_W = GRID_H = 5        # 5x5 grid
+NUM_NODES = GRID_W * GRID_H  # 25
 NUM_ACTIONS = 4              # UP, RIGHT, DOWN, LEFT
 
 # state components sizes
@@ -19,7 +19,12 @@ NY = NUM_NODES               # y = destination node index 0..15
 NC = 4                       # cong levels 0..3
 ND = 4                       # dir values 0..3
 
-NUM_STATES = NX * NY * NC * ND
+NUM_DIR = 4 #RIGHT-DOWN, DOWN-LEFT, LEFT-UP, UP-RIGHT
+NEIGHBOUR_SIZE = 8
+
+# NUM_STATES = NX * NY * NC * ND
+
+NUM_STATES = NUM_DIR * (2 ** NEIGHBOUR_SIZE)
 
 # -------------------------
 # Training hyperparams
