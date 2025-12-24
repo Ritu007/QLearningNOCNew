@@ -88,19 +88,63 @@ print(f"Q-table shape: {q_table.shape}, bytes: {q_table.nbytes} (~{q_table.nbyte
 # -------------------------
 def idx_to_coord(idx):
     """Flatten index 0..NUM_NODES-1 -> (x,y)"""
-    x = idx % GRID_W
-    y = idx // GRID_W
+    y = idx % GRID_W
+    x = idx // GRID_W
     return x, y
 
 def coord_to_idx(x, y):
-    return int(y * GRID_W + x)
+    return int(x * GRID_W + y)
 
 def in_bounds(x, y):
-    return 0 <= x < GRID_W and 0 <= y < GRID_H
+    return 0 <= x < GRID_H and 0 <= y < GRID_W
 
-def state_index(x_idx, y_idx, cong, dir_idx):
-    """Pack (x (0..15), y (0..15), cong (0..3), dir (0..3)) -> 0..NUM_STATES-1"""
-    return ((((int(x_idx) * NY) + int(y_idx)) * NC + int(cong)) * ND + int(dir_idx))
+# def state_index(x_idx, y_idx, cong, dir_idx):
+#     """Pack (x (0..15), y (0..15), cong (0..3), dir (0..3)) -> 0..NUM_STATES-1"""
+#     return ((((int(x_idx) * NY) + int(y_idx)) * NC + int(cong)) * ND + int(dir_idx))
+
+def state_index(source, destination, faulty_routers, N=GRID_W):
+    # source/destination: (row, col)
+    sx, sy = idx_to_coord(source)
+    dx, dy = idx_to_coord(destination)
+    delx = dx - sx
+    dely = dy - sy
+
+    # dir mapping: 0=right,1=down,2=left,3=up
+    if dely > 0:
+        dir = 0 if delx >= 0 else 3
+    elif dely == 0:
+        dir = 1 if delx > 0 else 3
+    else:  # dely < 0
+        dir = 1 if delx > 0 else 2
+    print("dir", dir)
+    # neighbors: right, down, left, up
+    deltas = [(0,1),(1,0),(0,-1),(-1,0)]
+    delta_th = [
+        [(0,2),(1,1),(2,0),(1,2)],
+        [(2,0),(1,-1),(0,-2),(2,-1)],
+        [(0,-2),(-1,-1),(-2,0),(-1,-2)],
+        [(-2,0),(-1,1),(0,2),(-2,1)]
+    ]
+
+    faulty_set = set(faulty_routers)
+    def is_fault(p):
+        if N is not None:
+            r,c = p
+            if not (0 <= r < N and 0 <= c < N):
+                return 1
+        return 1 if p in faulty_set else 0
+    neigh = []
+    bits = 0
+    for off in deltas:
+        bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+        neigh.append(is_fault((sx + off[0], sy + off[1])))
+    for off in delta_th[dir]:
+        bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+        neigh.append(is_fault((sx + off[0], sy + off[1])))
+    # print("NEigh", neigh)
+    packed = (dir << 8) | bits
+    # optional: return components for debugging
+    return packed  # or return dir, bits, packed
 
 # -------------------------
 # Links precompute
@@ -303,17 +347,17 @@ def reward_components(prev_pos, new_pos, dst_pos, was_blocked, cong_level, node_
 # -------------------------
 # Fault generation
 # -------------------------
-def generate_random_faults(max_node_faults=2, max_link_faults=2, avoid_nodes=None):
+def generate_random_faults(max_node_faults=2, max_link_faults=0, avoid_nodes=None):
     nodes = [(x, y) for x in range(GRID_W) for y in range(GRID_H)]
     if avoid_nodes:
         nodes = [n for n in nodes if n not in avoid_nodes]
     node_fault_count = random.randint(0, max_node_faults)
     faulty_nodes = set(random.sample(nodes, k=node_fault_count)) if node_fault_count > 0 else set()
     # link faults
-    possible_links = [L for L in ALL_LINKS if not (avoid_nodes and any(node in avoid_nodes for node in L))]
-    link_fault_count = random.randint(0, max_link_faults)
-    faulty_links = set(random.sample(possible_links, k=link_fault_count)) if link_fault_count > 0 else set()
-    return faulty_nodes, faulty_links
+    # possible_links = [L for L in ALL_LINKS if not (avoid_nodes and any(node in avoid_nodes for node in L))]
+    # link_fault_count = random.randint(0, max_link_faults)
+    # faulty_links = set(random.sample(possible_links, k=link_fault_count)) if link_fault_count > 0 else set()
+    return faulty_nodes
 
 # -------------------------
 # Training loop (multi-packet)
@@ -328,14 +372,9 @@ link_visit_count = defaultdict(float)
 for episode in range(HM_EPISODES):
     # prepare per-episode items
     # choose representative avoid set to avoid marking initial start/dest faulty; we'll use random injection later
-    avoid_nodes = None
 
-    faulty_nodes, faulty_links = generate_random_faults(max_node_faults=2, max_link_faults=2, avoid_nodes=avoid_nodes)
 
     active_packets = []
-    episode_reward = 0.0
-    timestep = 0
-
     # optionally seed environment with a couple of packets initially
     # inject one or two to start
     for _ in range(1):
@@ -344,6 +383,12 @@ for episode in range(HM_EPISODES):
         while d == s:
             d = random.randrange(NUM_NODES)
         active_packets.append(Packet(s, d))
+
+    avoid_nodes = [s, d]
+    faulty_nodes, faulty_links = generate_random_faults(max_node_faults=2, max_link_faults=0, avoid_nodes=avoid_nodes)
+
+    episode_reward = 0.0
+    timestep = 0
 
     while timestep < MAX_TIMESTEPS:
         timestep += 1
@@ -381,7 +426,7 @@ for episode in range(HM_EPISODES):
             cong_level, dir_idx = compute_cong_dir_at(prev, node_visit_count, link_visit_count, faulty_nodes, faulty_links, active_packets)
 
             # build state index: x=current node index, y=destination node index
-            s_idx = state_index(cur_idx, dst_idx, cong_level, dir_idx)
+            s_idx = state_index(cur_idx, dst_idx, faulty_nodes)
 
             # action selection: epsilon-greedy on q_table
             if random.random() < EPSILON:
@@ -430,7 +475,7 @@ for episode in range(HM_EPISODES):
 
             # get next state (post-action)
             new_cong, new_dir = compute_cong_dir_at(new_pos, node_visit_count, link_visit_count, faulty_nodes, faulty_links, active_packets)
-            s2_idx = state_index(coord_to_idx(new_pos[0], new_pos[1]), dst_idx, new_cong, new_dir)
+            s2_idx = state_index(coord_to_idx(new_pos[0], new_pos[1]), dst_idx, faulty_nodes)
 
             # Q-learning update
             max_future = np.max(q_table[s2_idx])
