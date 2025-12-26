@@ -71,10 +71,11 @@ CONGESTION_DECAY = 0.92
 # -------------------------
 PORTS = ['UP', 'RIGHT', 'DOWN', 'LEFT']
 DELTAS = {
-    0: (0, -1),   # UP    (x, y) -> (x, y-1)
-    1: (1, 0),    # RIGHT
-    2: (0, 1),    # DOWN
-    3: (-1, 0)    # LEFT
+      # UP    (x, y) -> (x, y-1)
+    0: (1, 0),    # RIGHT
+    1: (0, 1),    # DOWN
+    2: (-1, 0),   # LEFT
+    3: (0, -1),   # UP
 }
 
 # -------------------------
@@ -96,7 +97,7 @@ def coord_to_idx(x, y):
     return int(x * GRID_W + y)
 
 def in_bounds(x, y):
-    return 0 <= x < GRID_H and 0 <= y < GRID_W
+    return 0 <= x < GRID_W and 0 <= y < GRID_H
 
 # def state_index(x_idx, y_idx, cong, dir_idx):
 #     """Pack (x (0..15), y (0..15), cong (0..3), dir (0..3)) -> 0..NUM_STATES-1"""
@@ -116,7 +117,7 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
         dir = 1 if delx > 0 else 3
     else:  # dely < 0
         dir = 1 if delx > 0 else 2
-    print("dir", dir)
+    # print("dir", dir)
     # neighbors: right, down, left, up
     deltas = [(0,1),(1,0),(0,-1),(-1,0)]
     delta_th = [
@@ -354,10 +355,10 @@ def generate_random_faults(max_node_faults=2, max_link_faults=0, avoid_nodes=Non
     node_fault_count = random.randint(0, max_node_faults)
     faulty_nodes = set(random.sample(nodes, k=node_fault_count)) if node_fault_count > 0 else set()
     # link faults
-    # possible_links = [L for L in ALL_LINKS if not (avoid_nodes and any(node in avoid_nodes for node in L))]
-    # link_fault_count = random.randint(0, max_link_faults)
-    # faulty_links = set(random.sample(possible_links, k=link_fault_count)) if link_fault_count > 0 else set()
-    return faulty_nodes
+    possible_links = [L for L in ALL_LINKS if not (avoid_nodes and any(node in avoid_nodes for node in L))]
+    link_fault_count = random.randint(0, max_link_faults)
+    faulty_links = set(random.sample(possible_links, k=link_fault_count)) if link_fault_count > 0 else set()
+    return faulty_nodes, faulty_links
 
 # -------------------------
 # Training loop (multi-packet)
@@ -373,7 +374,6 @@ for episode in range(HM_EPISODES):
     # prepare per-episode items
     # choose representative avoid set to avoid marking initial start/dest faulty; we'll use random injection later
 
-
     active_packets = []
     # optionally seed environment with a couple of packets initially
     # inject one or two to start
@@ -384,8 +384,10 @@ for episode in range(HM_EPISODES):
             d = random.randrange(NUM_NODES)
         active_packets.append(Packet(s, d))
 
-    avoid_nodes = [s, d]
+    avoid_nodes = [idx_to_coord(s), idx_to_coord(d)]
     faulty_nodes, faulty_links = generate_random_faults(max_node_faults=2, max_link_faults=0, avoid_nodes=avoid_nodes)
+
+    # print("faulty", faulty_nodes)
 
     episode_reward = 0.0
     timestep = 0
@@ -397,8 +399,14 @@ for episode in range(HM_EPISODES):
         if len(active_packets) < MAX_ACTIVE_PACKETS and random.random() < PACKET_INJECTION_PROB:
             s = random.randrange(NUM_NODES)
             d = random.randrange(NUM_NODES)
+
+            while d in faulty_nodes:
+                d = random.randrange(NUM_NODES)
+            while s in faulty_nodes:
+                s = random.randrange(NUM_NODES)
             while d == s:
                 d = random.randrange(NUM_NODES)
+
             active_packets.append(Packet(s, d))
 
         if len(active_packets) == 0 and timestep > 10 and episode > 10:
