@@ -551,7 +551,48 @@ class NetworkEnv:
         faulty_links = set(random.sample(possible_links, k=link_fault_count)) if link_fault_count > 0 else set()
 
         self.set_faults(faulty_nodes, faulty_links)
+        # print("faulty nodes", faulty_nodes)
         return self.faulty_nodes, self.faulty_links
+
+    # def faulty_at_start(self,current_node, neighbor_cong):
+    #     faulty_nodes = self.faulty_nodes
+    #     x, y = current_node
+    #
+    #     for a in range(self.NUM_ACTIONS):
+    #         dr, dc = self.DELTAS[a]
+    #         nx, ny = x + dr, y + dc
+    #         if neighbor_cong[a] is None or neighbor_cong[a] == 3:
+    #             faulty_nodes.add((nx, ny))
+    #             continue
+    #     return faulty_nodes
+
+    def faulty_at_start(self, current_node, neighbor_cong):
+        """
+        Return a new set of neighbor node coords that should be considered faulty
+        for the state of `current_node` based on neighbor_cong.
+        Does NOT mutate self.faulty_nodes.
+        """
+        # start with explicit faulty nodes (copy) or start empty if you prefer
+        faulty_nodes = set(self.faulty_nodes)  # copy so we don't modify the original
+
+        x, y = current_node
+        for a in range(self.NUM_ACTIONS):
+            dr, dc = self.DELTAS[a]
+            nx, ny = x + dr, y + dc
+
+            # skip out-of-bounds neighbors
+            if not self.in_bounds(nx, ny):
+                continue
+
+            # safe access in case neighbor_cong is a dict with missing keys
+            lvl = neighbor_cong.get(a, None)
+
+            # decide when to mark neighbor faulty for this source node
+            # usually we only mark when level == 3 (sustained / no-vc)
+            if lvl == 3:
+                faulty_nodes.add((nx, ny))
+
+        return faulty_nodes
 
     # -----------------------
     # timestep lifecycle: update per-(node,port) EMA and persistence counters
