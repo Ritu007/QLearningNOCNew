@@ -248,7 +248,11 @@ for episode in range(HM_EPISODES):
             if new_pos == dst_coord:
                 pkt.done = True
                 # release VC at destination (packet delivered)
-                env.release_vc_at(new_pos)
+                # env.release_vc_at(new_pos)
+                # pkt.vc holds (node,port) which the packet currently occupies (or None)
+                env.release_vc_at(pkt.vc if pkt.vc is not None else new_pos)
+                pkt.vc = None
+
                 if pkt in active_packets:
                     active_packets.remove(pkt)
 
