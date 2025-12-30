@@ -417,8 +417,8 @@ class NetworkEnv:
                  vc_fault_persistence=5,
                  vc_clear_persistence=3,
                  vc_ema_alpha=0.25,
-                 history_scale=8.0,
-                 no_vc_threshold=10,
+                 history_scale= 100.0,
+                 no_vc_threshold=3,
                  sustained_congestion_threshold=30):
         # grid
         self.GRID_W = grid_w
@@ -634,21 +634,6 @@ class NetworkEnv:
                     else:
                         # slight decay to history
                         self.vc_congestion_history[(node, port)] = max(0, self.vc_congestion_history.get((node, port), 0) - 1)
-
-                # # Node-level sustained fault decision:
-                # # If any of the node's input ports exceeded short-term fault persistence -> mark node sustained_faulty
-                # node_full_any = any(self.vc_full_counter.get((node, p),0) >= self.VC_FAULT_PERSISTENCE for p in [0,1,2,3,self.LOCAL_PORT])
-                # if node_full_any:
-                #     self.sustained_faulty.add(node)
-                # # clear node sustained_faulty only when all input ports have been healthy for VC_CLEAR_PERSISTENCE
-                # node_recover_all = all(self.vc_recover_counter.get((node,p),0) >= self.VC_CLEAR_PERSISTENCE for p in [0,1,2,3,self.LOCAL_PORT])
-                # if node in self.sustained_faulty and node_recover_all:
-                #     self.sustained_faulty.discard(node)
-                #
-                # # long-run: if *any* port's congestion_history exceeds sustained threshold, force node sustained
-                # node_long_run = any(self.vc_congestion_history.get((node,p),0) >= self.SUSTAINED_CONGESTION_THRESHOLD for p in [0,1,2,3,self.LOCAL_PORT])
-                # if node_long_run:
-                #     self.sustained_faulty.add(node)
                 # -------------------------------
                 # PORT-level sustained-fault logic
                 # -------------------------------
@@ -808,6 +793,7 @@ class NetworkEnv:
 
         # compute neighbor congestion per outgoing action
         for a in range(self.NUM_ACTIONS):
+
             dr, dc = self.DELTAS[a]
             nx, ny = x + dr, y + dc
             if not self.in_bounds(nx, ny):
@@ -816,6 +802,7 @@ class NetworkEnv:
             neigh = (nx, ny)
             # the input port at neighbor that receives from current node is opp = (a+2)%4
             opp_port = (a + 2) % 4
+            # print(f"Node {node_pos}, Congestion History: {self.vc_congestion_history.get((neigh, opp_port), 0)}")
 
             # rule 1: if neighbor input port had NO_VC_THRESHOLD consecutive no-vc timesteps -> level 3
             if self.vc_no_vc_counter.get((neigh, opp_port), 0) >= self.NO_VC_THRESHOLD:
@@ -854,61 +841,65 @@ class NetworkEnv:
         #     return 3, 0, neighbor_congs
 
         # If current node itself has any input port in sustained_faulty_ports or no_vc counters >= NO_VC_THRESHOLD, treat as cong=3
-        if any(((x, y), p) in self.sustained_faulty_ports for p in [0, 1, 2, 3, self.LOCAL_PORT]) or any(
-                self.vc_no_vc_counter.get(((x, y), p), 0) >= self.NO_VC_THRESHOLD for p in
-                [0, 1, 2, 3, self.LOCAL_PORT]):
-            for i in range(self.NUM_ACTIONS):
-                if neighbor_congs.get(i) is not None:
-                    return 3, i, neighbor_congs
-            return 3, 0, neighbor_congs
-
-        # if any neighbor has level 3, pick first such dir and set cong=3 (avoid moving into it)
-        for i in range(self.NUM_ACTIONS):
-            if neighbor_congs.get(i) == 3:
-                return 3, i, neighbor_congs
-
-        # otherwise use node-level EMA average across its input ports to estimate cong 0/1/2
-        # compute average EMA across the valid input ports
-        ema_vals = []
-        for p in range(4):
-            if ( (x,y), p ) in self.vc_cong_ema:
-                ema_vals.append(self.vc_cong_ema.get(((x,y),p), 0.0))
-            else:
-                # if port invalid, skip
-                ema_vals.append(0.0)
-        avg_ema = sum(ema_vals) / max(1, len(ema_vals))
-        if avg_ema >= 0.66:
-            cong = 2
-        elif avg_ema >= 0.33:
-            cong = 1
-        else:
-            cong = 0
-
-        # dir = port with maximum neighbor occupancy proxy (based on node_visit counts)
-        occ = {}
-        for i in range(self.NUM_ACTIONS):
-            dr, dc = self.DELTAS[i]
-            nx, ny = x + dr, y + dc
-            if not self.in_bounds(nx, ny):
-                occ[i] = -1.0
-            else:
-                neigh = (nx, ny)
-                occ[i] = min(1.0, self.node_visit_count.get(neigh, 0) / max(1.0, self.HISTORY_SCALE))
-        dir_idx = max(range(self.NUM_ACTIONS), key=lambda a: (occ[a], -a))
-        return cong, dir_idx, neighbor_congs
-
+        # if any(((x, y), p) in self.sustained_faulty_ports for p in [0, 1, 2, 3, self.LOCAL_PORT]) or any(
+        #         self.vc_no_vc_counter.get(((x, y), p), 0) >= self.NO_VC_THRESHOLD for p in
+        #         [0, 1, 2, 3, self.LOCAL_PORT]):
+        #     for i in range(self.NUM_ACTIONS):
+        #         if neighbor_congs.get(i) is not None:
+        #             return 3, i, neighbor_congs
+        #     return 3, 0, neighbor_congs
+        #
+        # # if any neighbor has level 3, pick first such dir and set cong=3 (avoid moving into it)
+        # for i in range(self.NUM_ACTIONS):
+        #     if neighbor_congs.get(i) == 3:
+        #         return 3, i, neighbor_congs
+        #
+        # # otherwise use node-level EMA average across its input ports to estimate cong 0/1/2
+        # # compute average EMA across the valid input ports
+        # ema_vals = []
+        # for p in range(4):
+        #     if ( (x,y), p ) in self.vc_cong_ema:
+        #         ema_vals.append(self.vc_cong_ema.get(((x,y),p), 0.0))
+        #     else:
+        #         # if port invalid, skip
+        #         ema_vals.append(0.0)
+        # avg_ema = sum(ema_vals) / max(1, len(ema_vals))
+        # if avg_ema >= 0.66:
+        #     cong = 2
+        # elif avg_ema >= 0.33:
+        #     cong = 1
+        # else:
+        #     cong = 0
+        #
+        # # dir = port with maximum neighbor occupancy proxy (based on node_visit counts)
+        # occ = {}
+        # for i in range(self.NUM_ACTIONS):
+        #     dr, dc = self.DELTAS[i]
+        #     nx, ny = x + dr, y + dc
+        #     if not self.in_bounds(nx, ny):
+        #         occ[i] = -1.0
+        #     else:
+        #         neigh = (nx, ny)
+        #         occ[i] = min(1.0, self.node_visit_count.get(neigh, 0) / max(1.0, self.HISTORY_SCALE))
+        # dir_idx = max(range(self.NUM_ACTIONS), key=lambda a: (occ[a], -a))
+        # return cong, dir_idx, neighbor_congs
+        return neighbor_congs
     # -----------------------
     # neighbourhood congestion for reward shaping (keeps node-level)
     # -----------------------
     def neighbourhood_congestion(self, center_pos, active_packets=None, radius=1):
         neigh_nodes = []
+
         cx, cy = center_pos
         for r in range(self.GRID_H):
             for c in range(self.GRID_W):
                 if abs(cx - r) + abs(cy - c) <= radius:
                     neigh_nodes.append((r, c))
+        non_existing_neigh = 5 - len(neigh_nodes)
+        # print(f"Node: {center_pos}, Neigh Nodes: {neigh_nodes}")
         node_area = max(1, len(neigh_nodes))
         total_hist = sum(self.node_visit_count.get(n, 0) for n in neigh_nodes)
+        # print(f"Node: {center_pos}, Total Hist: {total_hist}")
         avg_hist = total_hist / node_area
         hist_score = float(math.tanh(avg_hist / max(1.0, self.HISTORY_SCALE)))
 
@@ -918,9 +909,28 @@ class NetworkEnv:
                 if abs(p.pos[0] - cx) + abs(p.pos[1] - cy) <= radius:
                     active_in_neigh += 1
 
-        active_scale = max(1.0, node_area * 0.5)
+        active_scale = self.NUM_VCS * 2
         active_score = float(math.tanh(active_in_neigh / active_scale))
+        # print(f"Active in Neigh: {active_in_neigh} ")
 
-        W_HIST, W_ACTIVE = 0.6, 0.4
+        W_HIST, W_ACTIVE = 0.1, 0.9
         combined = W_HIST * hist_score + W_ACTIVE * active_score
-        return float(min(max(combined, 0.0), 1.0)), {'hist': hist_score, 'active': active_score, 'active_in_neigh': active_in_neigh}
+        # print(f"Hist {hist_score}, Active: {active_score}, Combined: {combined}")
+        fault_in_neigh = 0
+        for node in neigh_nodes:
+            if node in self.faulty_nodes:
+                # print("Faulty", node)
+                fault_in_neigh += 1
+
+        for port in [0, 1, 2, 3]:
+            neigh_node = center_pos[0] + self.DELTAS[port][0], center_pos[1] + self.DELTAS[port][1]
+            if (center_pos, port) in self.sustained_faulty_ports and neigh_node not in self.faulty_nodes:
+                fault_in_neigh += 1
+                # print("Sustained Faulty", neigh_node, "Port", port)
+        # fault_in_neigh += non_existing_neigh
+        MAX_FAULT = 5
+
+        fault_score = float(math.tanh(fault_in_neigh / MAX_FAULT))
+        # print(F"Fault Score: {fault_score}, Fault in neigh: {fault_in_neigh}")
+
+        return float(min(max(combined, 0.0), 1.0)), fault_score, {'hist': hist_score, 'active': active_score, 'fault': fault_in_neigh, 'active_in_neigh': active_in_neigh}

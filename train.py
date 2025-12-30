@@ -12,12 +12,12 @@ from updated_env import NetworkEnv, Packet
 # Training & env hyperparams
 # -------------------------
 GRID_W = GRID_H = 5
-NUM_VCS = 2
+NUM_VCS = 4
 
 # instantiate environment
 env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
                  vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
-                 history_scale=8.0)
+                 history_scale=50.0)
 
 NUM_NODES = env.NUM_NODES
 NUM_ACTIONS = env.NUM_ACTIONS
@@ -27,7 +27,7 @@ NC = 4
 ND = 4
 NX = GRID_H  # rows
 NY = GRID_W  # cols
-NUM_FAULTY = 8
+NUM_FAULTY = 7
 
 # NUM_STATES = (NX * NY) * NUM_NODES * NC * ND  # current node (row,col) x destination x cong x dir
 
@@ -38,29 +38,30 @@ q_table = np.random.uniform(-1, 0, size=(NUM_STATES, NUM_ACTIONS)).astype(np.flo
 print(f"Q-table shape: {q_table.shape}, bytes: {q_table.nbytes} (~{q_table.nbytes/1024:.1f} KB)")
 
 # RL hyperparams
-HM_EPISODES = 10000
-EXPLORATION_EPISOPES = 2000
+HM_EPISODES = 40000
+EXPLORATION_EPISOPES = 5000
 MAX_TIMESTEPS = 400
 
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0002
 DISCOUNT = 0.95
 
 EPSILON = 0.95
-EPS_DECAY = 0.9995
+EPS_DECAY = 0.99995
 
 # multi-packet params
-MAX_ACTIVE_PACKETS = 20
-PACKET_INJECTION_PROB = 0.25
-PACKET_MAX_AGE = 200
+MAX_ACTIVE_PACKETS = 40
+PACKET_INJECTION_PROB = 1
+PACKET_MAX_AGE = 400
 
 # reward hyperparams (keep in sync with env if changed)
 MOVE_PENALTY = 2
 DEST_REWARD = 200
-W_MOVE = 2.0
+W_MOVE = 3.0
 W_DIR = 20.0
 W_FAULT = 30.0
-W_LOCAL_CONG = 2.0
-W_NEIGH_CONG = 10.0
+W_LOCAL_CONG = 4.0
+W_NEIGH_CONG = 20.0
+W_NEIGH_FAULT = 10.0
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
 R_MAX = 1000.0
@@ -68,13 +69,6 @@ R_MAX = 1000.0
 # -------------------------
 # helpers for state index
 # -------------------------
-def state_index_from(row, col, dst_idx, cong, dir_idx):
-    """Pack (row,col,dst,cong,dir) into linear index."""
-    node_index = row * GRID_W + col
-    # order: node_index (0..NUM_NODES-1), destination (0..NUM_NODES-1), cong, dir
-    base = (node_index * NUM_NODES) + dst_idx
-    return ((((base) * NC) + int(cong)) * ND) + int(dir_idx)
-
 def state_index(source, destination, faulty_routers, N=GRID_W):
     # source/destination: (row, col)
     sx, sy = env.idx_to_coord(source)
@@ -93,10 +87,10 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
     # neighbors: right, down, left, up
     deltas = [(0,1),(1,0),(0,-1),(-1,0)]
     delta_th = [
-        [(0,2),(1,1),(2,0),(1,2)],
-        [(2,0),(1,-1),(0,-2),(2,-1)],
-        [(0,-2),(-1,-1),(-2,0),(-1,-2)],
-        [(-2,0),(-1,1),(0,2),(-2,1)]
+        [(0,2),(1,1),(2,0)],
+        [(2,0),(1,-1),(0,-2)],
+        [(0,-2),(-1,-1),(-2,0)],
+        [(-2,0),(-1,1),(0,2)]
     ]
 
     faulty_set = set(faulty_routers)
@@ -115,7 +109,7 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
         bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
         neigh.append(is_fault((sx + off[0], sy + off[1])))
     # print("NEigh", neigh)
-    packed = (dir << 8) | bits
+    packed = (dir << 7) | bits
     # optional: return components for debugging
     return packed  # or return dir, bits, packed
 
@@ -129,7 +123,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     details = {}
     # base move
     stayed = (prev_pos == new_pos)
-    base_move_cost = MOVE_PENALTY + 10 if stayed else MOVE_PENALTY
+    base_move_cost = MOVE_PENALTY + 5 if stayed else MOVE_PENALTY
     details['R_move'] = -W_MOVE * base_move_cost
 
     # print("R_move", details['R_move'])
@@ -149,28 +143,36 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     # print("R_fault", details['R_fault'])
 
     # local congestion penalty
-    node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
-    traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
-    link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
-    node_norm = node_count / MAX_NODE_VISIT_CAP
-    link_norm = link_count / MAX_LINK_VISIT_CAP
-    details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
 
+    cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
+    details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
+                    'node_active_count': cong_info['active_in_neigh']})
+    details['R_local_cong'] = -W_LOCAL_CONG * cong_score
+    details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
+    # node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
+    # traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
+    # link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
+    # node_norm = node_count / MAX_NODE_VISIT_CAP
+    # link_norm = link_count / MAX_LINK_VISIT_CAP
+    # details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
+    #
     # print("R_local_cong", details['R_local_cong'])
 
     # neighbourhood congestion
-    neigh_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
-    details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_active_count': neigh_info['active_in_neigh']})
+    neigh_score, neigh_fault_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
+    details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_fault': neigh_info['fault'], 'neigh_active_count': neigh_info['active_in_neigh']})
     details['R_neigh'] = -W_NEIGH_CONG * neigh_score
+    details['R_neigh_fault'] += -W_NEIGH_FAULT * neigh_fault_score
 
     # print("R_neigh", details['R_neigh'])
+    # print("R_neigh_fault", details['R_neigh_fault'])
 
     # dest reward
     details['R_dest'] = DEST_REWARD if new_pos == dst_pos else 0.0
 
     # print("R_dest", details['R_dest'])
 
-    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest'])
+    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest','R_neigh_fault'])
     total = float(np.clip(total, -R_MAX, R_MAX))
     details['total'] = total
     details['prev_dist'] = prev_d
@@ -227,17 +229,11 @@ for episode in range(HM_EPISODES):
 
 
     while timestep < MAX_TIMESTEPS:
-        # print("Timestep", timestep)
-        # print("fault", env.faulty_nodes)
         timestep += 1
         env.start_timestep()
 
         # injection attempts
         if len(active_packets) < MAX_ACTIVE_PACKETS and random.random() < PACKET_INJECTION_PROB:
-            # s = random.randrange(NUM_NODES)
-            # d = random.randrange(NUM_NODES)
-            # while d == s:
-            #     d = random.randrange(NUM_NODES)
 
             s = random.randrange(NUM_NODES)
             d = random.randrange(NUM_NODES)
@@ -249,7 +245,6 @@ for episode in range(HM_EPISODES):
             while d == s:
                 d = random.randrange(NUM_NODES)
 
-            # active_packets.append(Packet(s, d))
             # skip inject if node explicitly faulty or sustained faulty
             sr, sc = env.idx_to_coord(s)
             if (sr, sc) in env.sustained_faulty_ports:
@@ -260,8 +255,8 @@ for episode in range(HM_EPISODES):
                     injected += 1
                     active_packets.append(pnew)
 
-        if len(active_packets) == 0 and timestep > 10 and episode > 10:
-            break
+        # if len(active_packets) == 0 and timestep > 10 and episode > 10:
+        #     break
 
         # per-timestep service order
         random.shuffle(active_packets)
@@ -276,9 +271,9 @@ for episode in range(HM_EPISODES):
             dst_coord = env.idx_to_coord(pkt.dst_idx)
 
             # compute cong & dir at current node (features)
-            cong_level, dir_idx,  neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
+            neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
             faulty_nodes = env.faulty_at_start(prev, neighbor_cong)
-            # print("faulty sustained", faulty_nodes)
+
             # build state index
             s_idx = state_index(env.coord_to_idx(prev[0], prev[1]), pkt.dst_idx, faulty_nodes, N=GRID_W)
 
@@ -310,13 +305,12 @@ for episode in range(HM_EPISODES):
             # compute reward
             r, details = compute_reward(prev, new_pos, dst_coord, was_blocked, neighbor_cong[action], env, active_packets)
 
-            # print("reawrd", r)
             pkt.cum_reward += r
             episode_reward += r
             pkt.age += 1
 
             # next state
-            new_cong, new_dir, neighbor_cong = env.compute_cong_dir_at(new_pos, active_packets=active_packets)
+            neighbor_cong = env.compute_cong_dir_at(new_pos, active_packets=active_packets)
             faulty_nodes = env.faulty_at_start(new_pos, neighbor_cong)
             s2_idx = state_index(env.coord_to_idx(new_pos[0], new_pos[1]), pkt.dst_idx, faulty_nodes, N=GRID_W)
 
@@ -344,7 +338,7 @@ for episode in range(HM_EPISODES):
     for packet in active_packets:
         packet_age += packet.age
     # epsilon decay
-    if episode > EXPLORATION_EPISOPES:
+    if episode > 10:
         EPSILON *= EPS_DECAY
 
     # end episode
@@ -381,7 +375,8 @@ for episode in range(HM_EPISODES):
             f"Dropped: {recent_avg_drp:.1f}, Active: {recent_avg_undel:.1f}, Avg Packet Age: {recent_avg_age:.1f}")
 
 # Save Q-table
-with open(f"qtable_grid{GRID_W}x{GRID_H}_vcs{NUM_VCS}_{int(time.time())}.pkl", "wb") as f:
-    pickle.dump(q_table, f)
+    if episode >= 20000 and episode % 10000 == 0:
+        with open(f"qtable_grid{GRID_W}x{GRID_H}_vcs{NUM_VCS}_{int(time.time())}.pkl", "wb") as f:
+            pickle.dump(q_table, f)
 
-print("Training finished. Q-table saved.")
+        print("Training finished. Q-table saved.")
