@@ -429,11 +429,11 @@ class NetworkEnv:
     def __init__(self,
                  grid_w=5, grid_h=5,
                  num_vcs=2,
-                 vc_fault_persistence=5,
-                 vc_clear_persistence=3,
+                 vc_fault_persistence=1,
+                 vc_clear_persistence=1,
                  vc_ema_alpha=0.25,
                  history_scale= 100.0,
-                 no_vc_threshold=3,
+                 no_vc_threshold=1,
                  sustained_congestion_threshold=30):
         # grid
         self.GRID_W = grid_w
@@ -628,8 +628,10 @@ class NetworkEnv:
                     avail = self.vc_free.get(key, 0)  # current free VCs (0..NUM_VCS)
                     # occupancy fraction: fraction of used VCs
                     occ_frac = float(max(0, self.NUM_VCS - avail)) / float(max(1, self.NUM_VCS))
-
+                    # print(f"Node: {node, port}, Avail: {avail}")
                     st = self.vc_state[key]
+
+                    # print(f"Key: {key}, State: {st}")
                     # EMA update
                     prev_ema = st['ema']
                     st['ema'] = (1 - self.VC_EMA_ALPHA) * prev_ema + self.VC_EMA_ALPHA * occ_frac
@@ -643,12 +645,12 @@ class NetworkEnv:
                         st['no_vc_streak'] = 0
 
                     # long-run history update (increment if currently congested by EMA or no_vc)
-                    congested_now = (st['no_vc_streak'] >= 1) or (st['ema'] >= 0.5)
+                    congested_now = (st['no_vc_streak'] >= 1) or (st['ema'] >= 0.66)
                     if congested_now:
                         st['history'] = st.get('history', 0) + 1
                     else:
                         # gentle decay
-                        st['history'] = max(0, st.get('history', 0) - 1)
+                        st['history'] = max(0, st.get('history', 0) - 15)
 
                     # sustained flag logic (single place controlling policy)
                     # set sustained if either short-term full_streak meets persistence
@@ -669,6 +671,59 @@ class NetworkEnv:
                         if key in self.sustained_faulty_ports:
                             self.sustained_faulty_ports.discard(key)
 
+    def update_node_status(self, nodes):
+        """Reset per-timestep structures and update EMA/persistence for every (node,port)."""
+        self.vc_reserved.clear()
+        self.occupied_links.clear()
+
+        for node in range(nodes):
+            # node = (r, c)
+            # iterate ports (0..3) + LOCAL_PORT if used
+            for port in [0, 1, 2, 3, self.LOCAL_PORT]:
+                key = (node, port)
+                avail = self.vc_free.get(key, 0)  # current free VCs (0..NUM_VCS)
+                # occupancy fraction: fraction of used VCs
+                occ_frac = float(max(0, self.NUM_VCS - avail)) / float(max(1, self.NUM_VCS))
+                print(f"Node: {node, port}, Avail: {avail}")
+                st = self.vc_state[key]
+                # EMA update
+                prev_ema = st['ema']
+                st['ema'] = (1 - self.VC_EMA_ALPHA) * prev_ema + self.VC_EMA_ALPHA * occ_frac
+
+                # streak updates
+                if avail <= 0:
+                    st['no_vc_streak'] = st.get('no_vc_streak', 0) + 1
+                    st['recover_streak'] = 0
+                else:
+                    st['recover_streak'] = st.get('recover_streak', 0) + 1
+                    st['no_vc_streak'] = 0
+
+                # long-run history update (increment if currently congested by EMA or no_vc)
+                congested_now = (st['no_vc_streak'] >= 1) or (st['ema'] >= 0.66)
+                if congested_now:
+                    st['history'] = st.get('history', 0) + 1
+                else:
+                    # gentle decay
+                    st['history'] = max(0, st.get('history', 0) - 15)
+
+                # sustained flag logic (single place controlling policy)
+                # set sustained if either short-term full_streak meets persistence
+                if st['no_vc_streak'] >= self.VC_FAULT_PERSISTENCE:
+                    st['sustained'] = True
+                # OR if long-run history exceeded threshold
+                if st['history'] >= self.SUSTAINED_CONGESTION_THRESHOLD:
+                    st['sustained'] = True
+                # clear sustained only if recover streak exceeds clear persistence
+                if st['sustained'] and st['recover_streak'] >= self.VC_CLEAR_PERSISTENCE:
+                    st['sustained'] = False
+
+                # sync set for quick lookup
+                if st['sustained']:
+                    self.sustained_faulty_ports.add(key)
+                else:
+                    # remove if present
+                    if key in self.sustained_faulty_ports:
+                        self.sustained_faulty_ports.discard(key)
 
     def end_timestep(self):
         pass
@@ -713,24 +768,34 @@ class NetworkEnv:
         prev = pkt.pos
         dr, dc = self.DELTAS[action]
         intended = (prev[0] + dr, prev[1] + dc)
+        blocked = {
+                    "oob": False,
+                    "faulty": False,
+                    "sustained": False,
+                    "no_vc": False,
+                    "busy_link": False,
+        }
 
         # bounds check
         if not self.in_bounds(*intended):
-            return True, None, prev
-
-        # explicit node faults or sustained faults block
-        # if intended in self.faulty_nodes or intended in self.sustained_faulty:
-        #     return True, None, prev
+            # print("Blocked by out of bound")
+            blocked['oob'] = True
+            return blocked, None, prev
 
         # check explicit node-level faults
         if intended in self.faulty_nodes:
-            return True, None, prev
+            # print("Blocked by faulty")
+            blocked['faulty'] = True
+            return blocked, None, prev
 
         # neighbor input port that must be acquired: opp = (action + 2) % 4
         opp_port = (action + 2) % 4
         # If that specific (neighbor, opp_port) was flagged sustained-faulty, block
         if ((intended, opp_port) in self.sustained_faulty_ports):
-            return True, None, prev
+            # print("sustained", self.sustained_faulty_ports)
+            # print(f"Blocked by sustained faulty at node {intended, opp_port}")
+            blocked['sustained'] = True
+            return blocked, None, prev
 
         # neighbor input port that must be acquired: opp = (action + 2) % 4
         opp_port = (action + 2) % 4
@@ -738,7 +803,9 @@ class NetworkEnv:
         avail = self.vc_free.get((intended, opp_port), 0) - self.vc_reserved.get((intended, opp_port), 0)
         if avail <= 0:
             # blocked due to no VC on neighbor in_port
-            return True, None, prev
+            # print("Blocked due to no available vc")
+            blocked['no_vc'] = True
+            return blocked, None, prev
 
         # tentatively reserve neighbor's input VC
         self.vc_reserved[(intended, opp_port)] += 1
@@ -752,7 +819,9 @@ class NetworkEnv:
             # revert and release reservation
             pkt.set_pos(prev[0], prev[1])
             self.vc_reserved[(intended, opp_port)] -= 1
-            return True, None, prev
+            # print("Blocked by busy link")
+            blocked['busy_link'] = True
+            return blocked, None, prev
 
         # commit the move:
         # consume the neighbor's input VC (reservation -> consumed)
@@ -773,8 +842,8 @@ class NetworkEnv:
             self.occupied_links.add(traversed_link)
             self.link_visit_count[traversed_link] = self.link_visit_count.get(traversed_link, 0.0) + 1.0
         self.node_visit_count[intended] = self.node_visit_count.get(intended, 0.0) + 1.0
-
-        return False, traversed_link, intended
+        # print(f"Traversed Link: {traversed_link}, Occupied Links: {self.occupied_links}")
+        return blocked, traversed_link, intended
     # -----------------------
     # release on delivery / forced removal
     # -----------------------
@@ -791,7 +860,7 @@ class NetworkEnv:
             node = pos_and_port
             self.vc_free[(node, self.LOCAL_PORT)] = self.vc_free.get((node, self.LOCAL_PORT), 0) + 1
     # -----------------------
-    # compute congestion & dir; return neighbor congestion levels per direction
+    # compute congestion in neighbourhood; return neighbor congestion levels per direction
     # -----------------------
     def compute_cong_dir_at(self, node_pos, active_packets=None):
         """
@@ -820,7 +889,7 @@ class NetworkEnv:
             # print(f"Node {node_pos}, Congestion History: {self.vc_congestion_history.get((neigh, opp_port), 0)}")
 
             st = self.vc_state.get((neigh, opp_port), {'no_vc_streak': 0, 'ema': 0.0, 'history': 0, 'sustained': False})
-            if st['no_vc_streak'] >= self.NO_VC_THRESHOLD:
+            if st['no_vc_streak'] >= self.VC_FAULT_PERSISTENCE:
                 neighbor_congs[a] = 3
                 continue
             if st['history'] >= self.SUSTAINED_CONGESTION_THRESHOLD:

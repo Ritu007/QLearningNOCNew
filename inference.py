@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Rectangle, RegularPolygon
 
 # from train import NUM_NODES
 from updated_env import NetworkEnv, Packet
@@ -14,31 +16,118 @@ from updated_env import NetworkEnv, Packet
 # Environment / constants - must match training
 # -------------------------
 GRID_W = GRID_H = 5
-NUM_VCS = 2
+NUM_VCS = 4
 NUM_ACTIONS = 4
 NUM_NODES = GRID_H * GRID_W
 MAX_TIMESTEPS = 400
 
-MAX_ACTIVE_PACKETS = 10
-PACKET_INJECTION_PROB = 0.25
-PACKET_MAX_AGE = 200
+MAX_ACTIVE_PACKETS = 200
+PACKET_INJECTION_PROB = 1
+PACKET_MAX_AGE = 400
 
 # Reward / scaling constants - copied from train.py (keep identical)
 MOVE_PENALTY = 2
 DEST_REWARD = 200
-W_MOVE = 2.0
+W_MOVE = 3.0
 W_DIR = 20.0
 W_FAULT = 30.0
-W_LOCAL_CONG = 2.0
-W_NEIGH_CONG = 10.0
+W_LOCAL_CONG = 4.0
+W_NEIGH_CONG = 20.0
+W_NEIGH_FAULT = 10.0
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
 R_MAX = 1000.0
 
+
 # instantiate environment
 env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
                  vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
-                 history_scale=8.0)
+                 history_scale=50.0)
+
+
+# -------------------------
+# drawing helpers
+# -------------------------
+NODE_BG = "#efefef"
+NODE_FAULTY_BG = "#d9534f"   # red-ish
+NODE_SUSTAIN_BG = "#f0ad4e"  # orange
+NODE_BORDER = "#444444"
+PACKET_COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+]
+
+PORT_MARKER_SIZE = 0.12  # fraction of cell
+
+def draw_grid(ax, env, active_packets, show_ports=True):
+    ax.clear()
+    ax.set_aspect('equal')
+    ax.set_xlim(0, env.GRID_W)
+    ax.set_ylim(0, env.GRID_H)
+    ax.invert_yaxis()  # so (0,0) is top-left like your coordinate system
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # draw cells
+    for r in range(env.GRID_H):
+        for c in range(env.GRID_W):
+            node = (r, c)
+            # base color
+            face = NODE_BG
+            if node in env.faulty_nodes:
+                face = NODE_FAULTY_BG
+            # if any sustained port exists at this node, slightly orange tinted
+            node_has_sustained = any(((node, p) in env.sustained_faulty_ports) for p in [0,1,2,3,env.LOCAL_PORT])
+            if node_has_sustained and (node not in env.faulty_nodes):
+                face = NODE_SUSTAIN_BG
+
+            rect = Rectangle((c, r), 1, 1, facecolor=face, edgecolor=NODE_BORDER)
+            ax.add_patch(rect)
+
+    # show port markers (triangles) for sustained ports
+    if show_ports:
+        for ((nr, nc), port) in env.sustained_faulty_ports:
+            if not env.in_bounds(nr, nc):
+                continue
+            # compute triangle position inside cell according to port: 0=UP,1=RIGHT,2=DOWN,3=LEFT
+            cx = nc + 0.5
+            cy = nr + 0.5
+            offset = 0.35
+            if port == 3:  # UP - triangle pointing up
+                tri = RegularPolygon((cx, cy - offset), numVertices=3, radius=0.15, orientation=0)
+            elif port == 0:  # RIGHT
+                tri = RegularPolygon((cx + offset, cy), numVertices=3, radius=0.15, orientation=0.5 * np.pi)
+            elif port == 1:  # DOWN
+                tri = RegularPolygon((cx, cy + offset), numVertices=3, radius=0.15, orientation=np.pi)
+            elif port == 2:  # LEFT
+                tri = RegularPolygon((cx - offset, cy), numVertices=3, radius=0.15, orientation=1.5 * np.pi)
+            else:  # local
+                tri = Circle((cx, cy), 0.08)
+            tri.set_facecolor("#7f0000")
+            tri.set_edgecolor("k")
+            ax.add_patch(tri)
+
+    # draw packets
+    for i, pkt in enumerate(active_packets):
+        px, py = pkt.pos  # (row,col)
+        cx = py + 0.5
+        cy = px + 0.5
+        color = PACKET_COLORS[i % len(PACKET_COLORS)]
+        circle = Circle((cx, cy), 0.25, color=color, zorder=4)
+        ax.add_patch(circle)
+        ax.text(cx, cy, (pkt.dst_idx, pkt.age), color="white", weight="bold", ha="center", va="center", zorder=5, fontsize=8)
+
+    # draw destinations as small black squares (if any active packets)
+    for pkt in active_packets:
+        dx, dy = env.idx_to_coord(pkt.dst_idx)
+        cx = dy + 0.5
+        cy = dx + 0.5
+        dest_rect = Rectangle((cx - 0.12, cy - 0.12), 0.24, 0.24, facecolor="#000000", zorder=3)
+        ax.add_patch(dest_rect)
+
+    ax.set_title(f"Packets: {len(active_packets)} | Sustained ports: {len(env.sustained_faulty_ports)} | Faulty nodes: {len(env.faulty_nodes)}")
+    return ax
+
 
 # -------------------------
 # helpers (same semantics as train.py)
@@ -64,10 +153,17 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
 
     deltas = [(0,1),(1,0),(0,-1),(-1,0)]
     delta_th = [
-        [(0,2),(1,1),(2,0),(1,2)],
-        [(2,0),(1,-1),(0,-2),(2,-1)],
-        [(0,-2),(-1,-1),(-2,0),(-1,-2)],
-        [(-2,0),(-1,1),(0,2),(-2,1)]
+        [(0,2),(1,1),(2,0)],
+        [(2,0),(1,-1),(0,-2)],
+        [(0,-2),(-1,-1),(-2,0)],
+        [(-2,0),(-1,1),(0,2)]
+    ]
+
+    delta_th = [
+        [(0, 2), (1, 1), (2, 0), (1,2)],
+        [(2, 0), (1, -1), (0, -2), (2,-1)],
+        [(0, -2), (-1, -1), (-2, 0), (-1,-2)],
+        [(-2, 0), (-1, 1), (0, 2), (-2,1)]
     ]
 
     faulty_set = set(faulty_routers)
@@ -94,7 +190,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     details = {}
     # base move
     stayed = (prev_pos == new_pos)
-    base_move_cost = MOVE_PENALTY + 10 if stayed else MOVE_PENALTY
+    base_move_cost = MOVE_PENALTY + 5 if stayed else MOVE_PENALTY
     details['R_move'] = -W_MOVE * base_move_cost
 
     # print("R_move", details['R_move'])
@@ -114,28 +210,36 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     # print("R_fault", details['R_fault'])
 
     # local congestion penalty
-    node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
-    traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
-    link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
-    node_norm = node_count / MAX_NODE_VISIT_CAP
-    link_norm = link_count / MAX_LINK_VISIT_CAP
-    details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
 
+    cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
+    details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
+                    'node_active_count': cong_info['active_in_neigh']})
+    details['R_local_cong'] = -W_LOCAL_CONG * cong_score
+    details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
+    # node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
+    # traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
+    # link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
+    # node_norm = node_count / MAX_NODE_VISIT_CAP
+    # link_norm = link_count / MAX_LINK_VISIT_CAP
+    # details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
+    #
     # print("R_local_cong", details['R_local_cong'])
 
     # neighbourhood congestion
-    neigh_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
-    details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_active_count': neigh_info['active_in_neigh']})
+    neigh_score, neigh_fault_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
+    details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_fault': neigh_info['fault'], 'neigh_active_count': neigh_info['active_in_neigh']})
     details['R_neigh'] = -W_NEIGH_CONG * neigh_score
+    details['R_neigh_fault'] += -W_NEIGH_FAULT * neigh_fault_score
 
     # print("R_neigh", details['R_neigh'])
+    # print("R_neigh_fault", details['R_neigh_fault'])
 
     # dest reward
     details['R_dest'] = DEST_REWARD if new_pos == dst_pos else 0.0
 
     # print("R_dest", details['R_dest'])
 
-    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest'])
+    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest','R_neigh_fault'])
     total = float(np.clip(total, -R_MAX, R_MAX))
     details['total'] = total
     details['prev_dist'] = prev_d
@@ -164,6 +268,8 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
         'total_attempts': 0,
         'avg_hops': []
     }
+    fig, ax = plt.subplots(figsize=(6, 6))
+    plt.ion()
 
     for episode in range(episodes):
         env.reset_counters()
@@ -246,7 +352,7 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                 dst_coord = env.idx_to_coord(pkt.dst_idx)
 
                 # compute cong & dir at current node (features)
-                cong_level, dir_idx, neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
+                neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
                 faulty_nodes = env.faulty_at_start(prev, neighbor_cong)
                 # print("faulty sustained", faulty_nodes)
                 # build state index
@@ -298,9 +404,16 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                     dropped += 1
                     packet_age += pkt.age
 
+            # draw
+            draw_grid(ax, env, active_packets, show_ports=True)
+            plt.pause(0.1)
+
             # end of timestep housekeeping
             env.end_timestep()
 
+        if render:
+            plt.ioff()
+            plt.show()
         # episode done
         stats['episodes'] += 1
         stats['injected'] += injected
@@ -354,9 +467,9 @@ def main():
     # create env
     env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
                      vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
-                     history_scale=8.0)
+                     history_scale=50.0)
 
-    res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed)
+    res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=True)
     print("==== Evaluation summary ====")
     for k, v in res.items():
         print(f"{k:25s}: {v}")

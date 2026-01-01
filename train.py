@@ -6,7 +6,7 @@ import pickle
 from collections import defaultdict
 
 # from fault_training import faulty_nodes
-from updated_env import NetworkEnv, Packet
+from new_environment import NetworkEnv, Packet
 
 # -------------------------
 # Training & env hyperparams
@@ -16,7 +16,7 @@ NUM_VCS = 4
 
 # instantiate environment
 env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
-                 vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
+                 vc_fault_persistence=1, vc_clear_persistence=1, vc_ema_alpha=0.25,
                  history_scale=50.0)
 
 NUM_NODES = env.NUM_NODES
@@ -46,7 +46,7 @@ LEARNING_RATE = 0.0002
 DISCOUNT = 0.95
 
 EPSILON = 0.95
-EPS_DECAY = 0.99995
+EPS_DECAY = 0.99985
 
 # multi-packet params
 MAX_ACTIVE_PACKETS = 40
@@ -54,10 +54,10 @@ PACKET_INJECTION_PROB = 1
 PACKET_MAX_AGE = 400
 
 # reward hyperparams (keep in sync with env if changed)
-MOVE_PENALTY = 2
+MOVE_PENALTY = 4
 DEST_REWARD = 200
 W_MOVE = 3.0
-W_DIR = 20.0
+W_DIR = 10.0
 W_FAULT = 30.0
 W_LOCAL_CONG = 4.0
 W_NEIGH_CONG = 20.0
@@ -116,7 +116,7 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
 # -------------------------
 # reward function (wraps env methods)
 # -------------------------
-def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj, active_packets):
+def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, active_packets):
     """
     Compose reward using env's counters and neighbourhood functions.
     """
@@ -133,36 +133,36 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     new_d = abs(new_pos[0] - dst_pos[0]) + abs(new_pos[1] - dst_pos[1])
     progress = prev_d - new_d
     max_grid_dist = (GRID_W - 1) + (GRID_H - 1)
+    if progress > 0:
+        progress *= 3
     details['R_dir'] = W_DIR * (progress / max(1, max_grid_dist))
 
     # print("R_dir", details['R_dir'])
 
+    details['R_busy_link'] = -1.0 if blocked['busy_link'] else 0.0
+    details['R_no_vc'] = -1.0 if blocked['no_vc'] else 0.0
+    details['R_oob'] = -1.0 if blocked['oob'] else 0.0
+    details["R_cong"] = -15.0 if (blocked['sustained'] or cong_level == 3) else 0.0
+
     # fault penalty
-    details['R_fault'] = -W_FAULT if (was_blocked or cong_level == 3) else 0.0
+    details['R_fault'] = -W_FAULT if (blocked['faulty']) else 0.0
 
     # print("R_fault", details['R_fault'])
 
     # local congestion penalty
+    # cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
+    # details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
+    #                 'node_active_count': cong_info['active_in_neigh']})
+    # details['R_local_cong'] = -W_LOCAL_CONG * cong_score
+    # details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
 
-    cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
-    details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
-                    'node_active_count': cong_info['active_in_neigh']})
-    details['R_local_cong'] = -W_LOCAL_CONG * cong_score
-    details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
-    # node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
-    # traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
-    # link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
-    # node_norm = node_count / MAX_NODE_VISIT_CAP
-    # link_norm = link_count / MAX_LINK_VISIT_CAP
-    # details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
-    #
     # print("R_local_cong", details['R_local_cong'])
 
     # neighbourhood congestion
     neigh_score, neigh_fault_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
     details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_fault': neigh_info['fault'], 'neigh_active_count': neigh_info['active_in_neigh']})
-    details['R_neigh'] = -W_NEIGH_CONG * neigh_score
-    details['R_neigh_fault'] += -W_NEIGH_FAULT * neigh_fault_score
+    details['R_neigh_cong'] = -W_NEIGH_CONG * neigh_score
+    details['R_neigh_fault'] = -W_NEIGH_FAULT * neigh_fault_score
 
     # print("R_neigh", details['R_neigh'])
     # print("R_neigh_fault", details['R_neigh_fault'])
@@ -172,7 +172,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
 
     # print("R_dest", details['R_dest'])
 
-    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest','R_neigh_fault'])
+    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_neigh_cong','R_dest','R_neigh_fault', 'R_busy_link', 'R_oob','R_cong','R_no_vc'])
     total = float(np.clip(total, -R_MAX, R_MAX))
     details['total'] = total
     details['prev_dist'] = prev_d
@@ -195,8 +195,10 @@ avg_dropped = []
 avg_undelivered = []
 
 for episode in range(HM_EPISODES):
+    # print("Episode", episode)
     # reset per-episode env counters if desired (vc_free etc.)
     env.reset_counters()
+
 
     # pick initial seed packet(s)
     active_packets = []
@@ -226,9 +228,8 @@ for episode in range(HM_EPISODES):
         injected += 1
         active_packets.append(p0)
 
-
-
     while timestep < MAX_TIMESTEPS:
+        # print("sustained faulty", env.sustained_faulty_ports)
         timestep += 1
         env.start_timestep()
 
@@ -284,7 +285,7 @@ for episode in range(HM_EPISODES):
                 action = int(np.argmax(q_table[s_idx]))
 
             # attempt move and commit
-            was_blocked, traversed_link, intended = env.attempt_and_commit_move(pkt, action)
+            blocked, traversed_link, intended = env.attempt_and_commit_move(pkt, action)
 
             new_pos = pkt.pos
 
@@ -303,7 +304,7 @@ for episode in range(HM_EPISODES):
                 packet_age += pkt.age
 
             # compute reward
-            r, details = compute_reward(prev, new_pos, dst_coord, was_blocked, neighbor_cong[action], env, active_packets)
+            r, details = compute_reward(prev, new_pos, dst_coord, blocked, neighbor_cong[action], env, active_packets)
 
             pkt.cum_reward += r
             episode_reward += r

@@ -445,10 +445,11 @@ class NetworkEnv:
             0: (0, 1),   # RIGHT
             1: (1, 0),   # DOWN
             2: (0, -1),   # LEFT
-            3: (-1, 0)  # UP
+            3: (-1, 0),  # UP
+            4: (0, 0), #STAY
         }
         self.PORTS = ['RIGHT', 'DOWN', 'LEFT', 'UP']
-        self.NUM_ACTIONS = 4
+        self.NUM_ACTIONS = 5
         self.ALL_PORT_INDICES = [0,1,2,3, self.LOCAL_PORT]
 
         # precompute links
@@ -502,7 +503,7 @@ class NetworkEnv:
                 # local port
                 self.vc_free[(node, self.LOCAL_PORT)] = self.NUM_VCS
                 # input ports 0..3
-                for p in range(4):
+                for p in range(self.NUM_ACTIONS):
                     dr, dc = self.DELTAS[p]
                     neighbor = (r + dr, c + dc)
                     if self.in_bounds(neighbor[0], neighbor[1]):
@@ -608,6 +609,7 @@ class NetworkEnv:
                 # update for each valid port (including LOCAL)
                 for port in [0,1,2,3,self.LOCAL_PORT]:
                     avail = self.vc_free.get((node, port), 0)
+                    # print(f"Node: {node, port}, Avail: {avail}")
                     # occupancy fraction for this (node,port)
                     occ_frac = float(max(0, self.NUM_VCS - avail)) / float(max(1, self.NUM_VCS))
                     prev = self.vc_cong_ema.get((node, port), 0.0)
@@ -699,6 +701,7 @@ class NetworkEnv:
 
         # bounds check
         if not self.in_bounds(*intended):
+            # print("Blocked by out of bound")
             return True, None, prev
 
         # explicit node faults or sustained faults block
@@ -707,12 +710,14 @@ class NetworkEnv:
 
         # check explicit node-level faults
         if intended in self.faulty_nodes:
+            # print("Blocked by faulty")
             return True, None, prev
 
         # neighbor input port that must be acquired: opp = (action + 2) % 4
         opp_port = (action + 2) % 4
         # If that specific (neighbor, opp_port) was flagged sustained-faulty, block
         if ((intended, opp_port) in self.sustained_faulty_ports):
+            # print("Blocked by sustained faulty")
             return True, None, prev
 
         # neighbor input port that must be acquired: opp = (action + 2) % 4
@@ -721,6 +726,7 @@ class NetworkEnv:
         avail = self.vc_free.get((intended, opp_port), 0) - self.vc_reserved.get((intended, opp_port), 0)
         if avail <= 0:
             # blocked due to no VC on neighbor in_port
+            # print("Blocked due to no available vc")
             return True, None, prev
 
         # tentatively reserve neighbor's input VC
@@ -735,6 +741,7 @@ class NetworkEnv:
             # revert and release reservation
             pkt.set_pos(prev[0], prev[1])
             self.vc_reserved[(intended, opp_port)] -= 1
+            # print("Blocked by busy link")
             return True, None, prev
 
         # commit the move:
@@ -756,7 +763,7 @@ class NetworkEnv:
             self.occupied_links.add(traversed_link)
             self.link_visit_count[traversed_link] = self.link_visit_count.get(traversed_link, 0.0) + 1.0
         self.node_visit_count[intended] = self.node_visit_count.get(intended, 0.0) + 1.0
-
+        # print(f"Traversed Link: {traversed_link}, Occupied Links: {self.occupied_links}")
         return False, traversed_link, intended
 
     # -----------------------
