@@ -395,6 +395,7 @@ class Packet:
         # pkt.vc holds the (node, port) where this packet currently occupies a VC
         # on injection we'll set it to (src_node, LOCAL_PORT)
         self.vc = None
+        self.history = set()
 
     @property
     def pos(self):
@@ -462,8 +463,12 @@ class NetworkEnv:
             2: (0, -1),   # LEFT
             3: (-1, 0)  # UP
         }
+
+        STAY_ACTION = 4
+        self.DELTAS[STAY_ACTION] = (0, 0)
+
         self.PORTS = ['RIGHT', 'DOWN', 'LEFT', 'UP']
-        self.NUM_ACTIONS = 4
+        self.NUM_ACTIONS = 5
         self.ALL_PORT_INDICES = [0,1,2,3, self.LOCAL_PORT]
 
         # precompute links
@@ -593,7 +598,7 @@ class NetworkEnv:
         faulty_nodes = set(self.faulty_nodes)  # copy so we don't modify the original
 
         x, y = current_node
-        for a in range(self.NUM_ACTIONS):
+        for a in range(self.NUM_ACTIONS - 1):
             dr, dc = self.DELTAS[a]
             nx, ny = x + dr, y + dc
 
@@ -753,6 +758,7 @@ class NetworkEnv:
         p = Packet(src_idx, dst_idx, self.idx_to_coord)
         # mark packet as occupying source's LOCAL VC
         p.vc = (node, self.LOCAL_PORT)
+        p.history.add(node)
         return p
 
     # -----------------------
@@ -774,7 +780,11 @@ class NetworkEnv:
                     "sustained": False,
                     "no_vc": False,
                     "busy_link": False,
+                    'stayed': False,
         }
+        if action == 4:
+            blocked['stayed'] = True
+            return blocked, None, prev
 
         # bounds check
         if not self.in_bounds(*intended):

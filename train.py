@@ -38,30 +38,31 @@ q_table = np.random.uniform(-1, 0, size=(NUM_STATES, NUM_ACTIONS)).astype(np.flo
 print(f"Q-table shape: {q_table.shape}, bytes: {q_table.nbytes} (~{q_table.nbytes/1024:.1f} KB)")
 
 # RL hyperparams
-HM_EPISODES = 40000
+HM_EPISODES = 40001
 EXPLORATION_EPISOPES = 5000
 MAX_TIMESTEPS = 400
 
-LEARNING_RATE = 0.0002
+LEARNING_RATE = 0.0001
 DISCOUNT = 0.95
 
 EPSILON = 0.95
-EPS_DECAY = 0.99985
+EPS_DECAY = 0.99988
 
 # multi-packet params
 MAX_ACTIVE_PACKETS = 40
 PACKET_INJECTION_PROB = 1
-PACKET_MAX_AGE = 400
+PACKET_MAX_AGE = 300
 
 # reward hyperparams (keep in sync with env if changed)
-MOVE_PENALTY = 4
-DEST_REWARD = 200
-W_MOVE = 3.0
+MOVE_PENALTY = 1
+DEST_REWARD = 50
+W_MOVE = 2
 W_DIR = 10.0
 W_FAULT = 30.0
-W_LOCAL_CONG = 4.0
-W_NEIGH_CONG = 20.0
-W_NEIGH_FAULT = 10.0
+W_LOCAL_CONG = 2.0
+W_NEIGH_CONG = 5.0
+W_NEIGH_FAULT = 0.0
+W_REVISIT = 10.0
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
 R_MAX = 1000.0
@@ -116,15 +117,22 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
 # -------------------------
 # reward function (wraps env methods)
 # -------------------------
-def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, active_packets):
+def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, active_packets, history):
     """
     Compose reward using env's counters and neighbourhood functions.
     """
     details = {}
     # base move
     stayed = (prev_pos == new_pos)
-    base_move_cost = MOVE_PENALTY + 5 if stayed else MOVE_PENALTY
+    base_move_cost = MOVE_PENALTY + 1 if stayed else MOVE_PENALTY
+    if blocked['stayed']:
+        base_move_cost *= 2
     details['R_move'] = -W_MOVE * base_move_cost
+    revisit_penalty = 0.0
+    # print(f"new pos {new_pos}, History: {history}")
+    if new_pos in history:
+        revisit_penalty = -W_REVISIT  # tune
+    details['R_revisit'] = revisit_penalty
 
     # print("R_move", details['R_move'])
 
@@ -139,10 +147,10 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
 
     # print("R_dir", details['R_dir'])
 
-    details['R_busy_link'] = -1.0 if blocked['busy_link'] else 0.0
-    details['R_no_vc'] = -1.0 if blocked['no_vc'] else 0.0
-    details['R_oob'] = -1.0 if blocked['oob'] else 0.0
-    details["R_cong"] = -15.0 if (blocked['sustained'] or cong_level == 3) else 0.0
+    details['R_busy_link'] = -2.0 if blocked['busy_link'] else 0.0
+    details['R_no_vc'] = -2.0 if blocked['no_vc'] else 0.0
+    details['R_oob'] = -4.0 if blocked['oob'] else 0.0
+    details["R_cong"] = -5.0 if (blocked['sustained'] or cong_level == 3) else 0.0
 
     # fault penalty
     details['R_fault'] = -W_FAULT if (blocked['faulty']) else 0.0
@@ -172,7 +180,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
 
     # print("R_dest", details['R_dest'])
 
-    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_neigh_cong','R_dest','R_neigh_fault', 'R_busy_link', 'R_oob','R_cong','R_no_vc'])
+    total = sum(details[k] for k in ['R_move','R_dir', 'R_revisit', 'R_fault','R_neigh_cong','R_dest','R_neigh_fault', 'R_busy_link', 'R_oob','R_cong','R_no_vc'])
     total = float(np.clip(total, -R_MAX, R_MAX))
     details['total'] = total
     details['prev_dist'] = prev_d
@@ -180,7 +188,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
     details['progress'] = progress
     details['cong_level'] = cong_level
 
-    # print("R_total", details['total'])
+    # print("R_total", details)
     return total, details
 
 # -------------------------
@@ -256,6 +264,7 @@ for episode in range(HM_EPISODES):
                     injected += 1
                     active_packets.append(pnew)
 
+
         # if len(active_packets) == 0 and timestep > 10 and episode > 10:
         #     break
 
@@ -303,11 +312,13 @@ for episode in range(HM_EPISODES):
                 delivered += 1
                 packet_age += pkt.age
 
+
             # compute reward
-            r, details = compute_reward(prev, new_pos, dst_coord, blocked, neighbor_cong[action], env, active_packets)
+            r, details = compute_reward(prev, new_pos, dst_coord, blocked, neighbor_cong[action], env, active_packets, pkt.history)
 
             pkt.cum_reward += r
             episode_reward += r
+            pkt.history.add(new_pos)
             pkt.age += 1
 
             # next state

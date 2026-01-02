@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle, RegularPolygon
 
 # from train import NUM_NODES
-from updated_env import NetworkEnv, Packet
+from new_environment import NetworkEnv, Packet
 
 # -------------------------
 # Environment / constants - must match training
@@ -21,19 +21,20 @@ NUM_ACTIONS = 4
 NUM_NODES = GRID_H * GRID_W
 MAX_TIMESTEPS = 400
 
-MAX_ACTIVE_PACKETS = 200
+MAX_ACTIVE_PACKETS = 1
 PACKET_INJECTION_PROB = 1
-PACKET_MAX_AGE = 400
+PACKET_MAX_AGE = 40
 
 # Reward / scaling constants - copied from train.py (keep identical)
-MOVE_PENALTY = 2
-DEST_REWARD = 200
-W_MOVE = 3.0
-W_DIR = 20.0
+MOVE_PENALTY = 1
+DEST_REWARD = 50
+W_MOVE = 2
+W_DIR = 10.0
 W_FAULT = 30.0
-W_LOCAL_CONG = 4.0
-W_NEIGH_CONG = 20.0
+W_LOCAL_CONG = 2.0
+W_NEIGH_CONG = 5.0
 W_NEIGH_FAULT = 10.0
+W_REVISIT = 5.0
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
 R_MAX = 1000.0
@@ -41,7 +42,7 @@ R_MAX = 1000.0
 
 # instantiate environment
 env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
-                 vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
+                 vc_fault_persistence=1, vc_clear_persistence=1, vc_ema_alpha=0.25,
                  history_scale=50.0)
 
 
@@ -133,11 +134,7 @@ def draw_grid(ax, env, active_packets, show_ports=True):
 # helpers (same semantics as train.py)
 # -------------------------
 def state_index(source, destination, faulty_routers, N=GRID_W):
-    """
-    Same state packing used in training.
-    source, destination: flattened indices (0..NUM_NODES-1)
-    faulty_routers: iterable of (r,c) tuples to be treated as 'faulty' in the state.
-    """
+    # source/destination: (row, col)
     sx, sy = env.idx_to_coord(source)
     dx, dy = env.idx_to_coord(destination)
     delx = dx - sx
@@ -150,20 +147,14 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
         dir = 1 if delx > 0 else 3
     else:  # dely < 0
         dir = 1 if delx > 0 else 2
-
+    # print("dir", dir)
+    # neighbors: right, down, left, up
     deltas = [(0,1),(1,0),(0,-1),(-1,0)]
     delta_th = [
         [(0,2),(1,1),(2,0)],
         [(2,0),(1,-1),(0,-2)],
         [(0,-2),(-1,-1),(-2,0)],
         [(-2,0),(-1,1),(0,2)]
-    ]
-
-    delta_th = [
-        [(0, 2), (1, 1), (2, 0), (1,2)],
-        [(2, 0), (1, -1), (0, -2), (2,-1)],
-        [(0, -2), (-1, -1), (-2, 0), (-1,-2)],
-        [(-2, 0), (-1, 1), (0, 2), (-2,1)]
     ]
 
     faulty_set = set(faulty_routers)
@@ -173,25 +164,36 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
             if not (0 <= r < N and 0 <= c < N):
                 return 1
         return 1 if p in faulty_set else 0
-
+    neigh = []
     bits = 0
     for off in deltas:
         bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+        neigh.append(is_fault((sx + off[0], sy + off[1])))
     for off in delta_th[dir]:
         bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+        neigh.append(is_fault((sx + off[0], sy + off[1])))
+    # print("NEigh", neigh)
+    packed = (dir << 7) | bits
+    # optional: return components for debugging
+    return packed  # or return dir, bits, packed
 
-    packed = (dir << 8) | bits
-    return packed
-
-def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj, active_packets):
+def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, active_packets, history):
     """
     Compose reward using env's counters and neighbourhood functions.
     """
     details = {}
     # base move
     stayed = (prev_pos == new_pos)
-    base_move_cost = MOVE_PENALTY + 5 if stayed else MOVE_PENALTY
+    base_move_cost = MOVE_PENALTY + 1 if stayed else MOVE_PENALTY
+    if blocked['stayed']:
+        base_move_cost *= 2
     details['R_move'] = -W_MOVE * base_move_cost
+    revisit_penalty = 0.0
+
+    print(f"new pos {new_pos}, History: {history}")
+    if new_pos in history:
+        revisit_penalty = -W_REVISIT  # tune
+    details['R_revisit'] = revisit_penalty
 
     # print("R_move", details['R_move'])
 
@@ -200,36 +202,36 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     new_d = abs(new_pos[0] - dst_pos[0]) + abs(new_pos[1] - dst_pos[1])
     progress = prev_d - new_d
     max_grid_dist = (GRID_W - 1) + (GRID_H - 1)
+    if progress > 0:
+        progress *= 3
     details['R_dir'] = W_DIR * (progress / max(1, max_grid_dist))
 
     # print("R_dir", details['R_dir'])
 
+    details['R_busy_link'] = -2.0 if blocked['busy_link'] else 0.0
+    details['R_no_vc'] = -2.0 if blocked['no_vc'] else 0.0
+    details['R_oob'] = -4.0 if blocked['oob'] else 0.0
+    details["R_cong"] = -5.0 if (blocked['sustained'] or cong_level == 3) else 0.0
+
     # fault penalty
-    details['R_fault'] = -W_FAULT if (was_blocked or cong_level == 3) else 0.0
+    details['R_fault'] = -W_FAULT if (blocked['faulty']) else 0.0
 
     # print("R_fault", details['R_fault'])
 
     # local congestion penalty
+    # cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
+    # details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
+    #                 'node_active_count': cong_info['active_in_neigh']})
+    # details['R_local_cong'] = -W_LOCAL_CONG * cong_score
+    # details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
 
-    cong_score, fault_score, cong_info = env_obj.neighbourhood_congestion(prev_pos, active_packets=active_packets, radius=1)
-    details.update({'node_hist': cong_info['hist'], 'node_active': cong_info['active'], 'node_fault': cong_info['fault'],
-                    'node_active_count': cong_info['active_in_neigh']})
-    details['R_local_cong'] = -W_LOCAL_CONG * cong_score
-    details['R_neigh_fault'] = -W_NEIGH_FAULT * fault_score
-    # node_count = min(env_obj.node_visit_count.get(new_pos, 0.0), MAX_NODE_VISIT_CAP)
-    # traversed_link = frozenset({prev_pos, new_pos}) if prev_pos != new_pos else None
-    # link_count = min(env_obj.link_visit_count.get(traversed_link, 0.0) if traversed_link is not None else 0.0, MAX_LINK_VISIT_CAP)
-    # node_norm = node_count / MAX_NODE_VISIT_CAP
-    # link_norm = link_count / MAX_LINK_VISIT_CAP
-    # details['R_local_cong'] = -W_LOCAL_CONG * (node_norm + link_norm)
-    #
     # print("R_local_cong", details['R_local_cong'])
 
     # neighbourhood congestion
     neigh_score, neigh_fault_score, neigh_info = env_obj.neighbourhood_congestion(new_pos, active_packets=active_packets, radius=1)
     details.update({'neigh_hist': neigh_info['hist'], 'neigh_active': neigh_info['active'], 'neigh_fault': neigh_info['fault'], 'neigh_active_count': neigh_info['active_in_neigh']})
-    details['R_neigh'] = -W_NEIGH_CONG * neigh_score
-    details['R_neigh_fault'] += -W_NEIGH_FAULT * neigh_fault_score
+    details['R_neigh_cong'] = -W_NEIGH_CONG * neigh_score
+    details['R_neigh_fault'] = -W_NEIGH_FAULT * neigh_fault_score
 
     # print("R_neigh", details['R_neigh'])
     # print("R_neigh_fault", details['R_neigh_fault'])
@@ -239,7 +241,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
 
     # print("R_dest", details['R_dest'])
 
-    total = sum(details[k] for k in ['R_move','R_dir','R_fault','R_local_cong','R_neigh','R_dest','R_neigh_fault'])
+    total = sum(details[k] for k in ['R_move','R_dir', 'R_revisit', 'R_fault','R_neigh_cong','R_dest','R_neigh_fault', 'R_busy_link', 'R_oob','R_cong','R_no_vc'])
     total = float(np.clip(total, -R_MAX, R_MAX))
     details['total'] = total
     details['prev_dist'] = prev_d
@@ -247,8 +249,9 @@ def compute_reward(prev_pos, new_pos, dst_pos, was_blocked, cong_level, env_obj,
     details['progress'] = progress
     details['cong_level'] = cong_level
 
-    # print("R_total", details['total'])
+    print("R_total", details)
     return total, details
+
 # -------------------------
 # Inference / evaluation loop
 # -------------------------
@@ -363,9 +366,10 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                 action = int(np.argmax(q_table[s_idx]))
 
                 # attempt move and commit
-                was_blocked, traversed_link, intended = env.attempt_and_commit_move(pkt, action)
+                blocked, traversed_link, intended = env.attempt_and_commit_move(pkt, action)
 
-                if was_blocked:
+                blocked_list = list(blocked.values())
+                if any(blocked_list):
                     stats['blocked_attempts'] += 1
                 stats['total_attempts'] += 1
 
@@ -387,13 +391,15 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                     hops_for_delivered.append(pkt.age)
 
                 # compute reward
-                r, details = compute_reward(prev, new_pos, dst_coord, was_blocked, neighbor_cong[action], env,
-                                            active_packets)
+                r, details = compute_reward(prev, new_pos, dst_coord, blocked, neighbor_cong[action], env,
+                                            active_packets, pkt.history)
 
                 # print("reawrd", r)
                 pkt.cum_reward += r
                 episode_reward += r
                 pkt.age += 1
+                pkt.history.add(new_pos)
+
 
                 # remove aged packets
                 if pkt.age > PACKET_MAX_AGE:
@@ -406,10 +412,12 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
 
             # draw
             draw_grid(ax, env, active_packets, show_ports=True)
-            plt.pause(0.1)
+            plt.pause(1)
 
             # end of timestep housekeeping
             env.end_timestep()
+        for packet in active_packets:
+            packet_age += packet.age
 
         if render:
             plt.ioff()
@@ -422,7 +430,7 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
         stats['total_reward'] += episode_reward
         stats['total_steps'] += episode_steps
         if hops_for_delivered:
-            stats['avg_hops'].append(sum(hops_for_delivered) / len(hops_for_delivered))
+            stats['avg_hops'].append(packet_age/injected)
 
     # Aggregate results
     delivered = stats['delivered']
@@ -469,7 +477,7 @@ def main():
                      vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
                      history_scale=50.0)
 
-    res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=True)
+    res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=False)
     print("==== Evaluation summary ====")
     for k, v in res.items():
         print(f"{k:25s}: {v}")
