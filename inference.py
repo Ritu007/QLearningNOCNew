@@ -11,13 +11,14 @@ from matplotlib.patches import Circle, Rectangle, RegularPolygon
 
 # from train import NUM_NODES
 from new_environment import NetworkEnv, Packet
+# from train import blocked
 
 # -------------------------
 # Environment / constants - must match training
 # -------------------------
 GRID_W = GRID_H = 5
 NUM_VCS = 4
-NUM_ACTIONS = 4
+NUM_ACTIONS = 5
 NUM_NODES = GRID_H * GRID_W
 MAX_TIMESTEPS = 400
 
@@ -156,7 +157,7 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
         [(0,-2),(-1,-1),(-2,0)],
         [(-2,0),(-1,1),(0,2)]
     ]
-
+    raw_state =[dir]
     faulty_set = set(faulty_routers)
     def is_fault(p):
         if N is not None:
@@ -172,10 +173,12 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
     for off in delta_th[dir]:
         bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
         neigh.append(is_fault((sx + off[0], sy + off[1])))
+
+    raw_state.extend(neigh)
     # print("NEigh", neigh)
     packed = (dir << 7) | bits
     # optional: return components for debugging
-    return packed  # or return dir, bits, packed
+    return raw_state, packed  # or return dir, bits, packed
 
 def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, active_packets, history):
     """
@@ -189,8 +192,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
         base_move_cost *= 2
     details['R_move'] = -W_MOVE * base_move_cost
     revisit_penalty = 0.0
-
-    print(f"new pos {new_pos}, History: {history}")
+    # print(f"new pos {new_pos}, History: {history}")
     if new_pos in history:
         revisit_penalty = -W_REVISIT  # tune
     details['R_revisit'] = revisit_penalty
@@ -249,7 +251,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
     details['progress'] = progress
     details['cong_level'] = cong_level
 
-    print("R_total", details)
+    # print("R_total", details)
     return total, details
 
 # -------------------------
@@ -455,6 +457,162 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
         'avg_hops': avg_hops
     }
 
+
+def manual_test_run(q_table, env, src, dst, faulty_nodes=None, faulty_links=None, max_steps=200, delay=0.25, render=True):
+    """
+    Manually run a single scenario:
+      - src, dst: either flattened indices or (row,col) tuples
+      - faulty_nodes: iterable of (row,col) coordinates to override (optional)
+      - faulty_links: iterable of frozenset pairs of node coords (optional)
+    Returns a dict of result info (delivered, steps, blocked_frac, history).
+    """
+    # normalize src/dst to flattened indices
+
+    # stats = {
+    #     'episodes': 0,
+    #     'delivered': 0,
+    #     'injected': 0,
+    #     'dropped': 0,
+    #     'total_reward': 0.0,
+    #     'total_steps': 0,
+    #     'blocked_attempts': 0,
+    #     'total_attempts': 0,
+    #     'avg_hops': []
+    # }
+
+    active_packets = []
+    timestep = 0
+    episode_reward = 0.0
+    episode_steps = 0
+    injected = 0
+    delivered = 0
+    dropped = 0
+    hops_for_delivered = []
+    packet_age = 0
+    blocked_attempts = 0
+    total_attempts = 0
+
+
+    if isinstance(src, tuple):
+        src_idx = env.coord_to_idx(src[0], src[1])
+    else:
+        src_idx = int(src)
+    if isinstance(dst, tuple):
+        dst_idx = env.coord_to_idx(dst[0], dst[1])
+    else:
+        dst_idx = int(dst)
+
+    # reset env
+    env.reset_counters()
+    if faulty_nodes is not None or faulty_links is not None:
+        env.set_faults(faulty_nodes if faulty_nodes is not None else [], faulty_links if faulty_links is not None else [])
+    else:
+        env.set_faults(set(), set())
+
+    # inject packet if possible
+    p = env.try_inject(src_idx, dst_idx)
+    if not p:
+        return {'error': 'could not inject at source (VC unavailable or sustained fault)'}
+
+    active_packets = [p]
+    injected += 1
+    stats = {'delivered':0, 'dropped':0, 'attempts':0, 'blocked':0, 'history':[]}
+
+    fig = None
+    ax = None
+    if render:
+        fig, ax = plt.subplots(figsize=(6,6))
+        plt.ion()
+
+    for step in range(max_steps):
+        env.start_timestep()
+        # update flags for injected node if helper exists
+        if hasattr(env, "update_port_flags_for_nodes"):
+            env.update_port_flags_for_nodes({env.idx_to_coord(src_idx)})
+
+        for pkt in list(active_packets):
+            if pkt.done:
+                if pkt in active_packets:
+                    active_packets.remove(pkt)
+                continue
+
+            prev = pkt.pos
+            dst_coord = env.idx_to_coord(pkt.dst_idx)
+
+            # compute cong & dir at current node (features)
+            neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
+            faulty_nodes = env.faulty_at_start(prev, neighbor_cong)
+            # print("faulty sustained", faulty_nodes)
+            # build state index
+            state, s_idx = state_index(env.coord_to_idx(prev[0], prev[1]), pkt.dst_idx, faulty_nodes, N=GRID_W)
+
+            # select action (epsilon-greedy)
+            print(f"State: {state}, Q-Value: {q_table[s_idx]}")
+            action = int(np.argmax(q_table[s_idx]))
+
+            # attempt move and commit
+            blocked, traversed_link, intended = env.attempt_and_commit_move(pkt, action)
+
+            blocked_list = list(blocked.values())
+            if any(blocked_list):
+                blocked_attempts += 1
+            total_attempts += 1
+
+            new_pos = pkt.pos
+
+            # if packet reached destination, mark done and release VC at dest (packet leaves)
+            if new_pos == dst_coord:
+                pkt.done = True
+                # release VC at destination (packet delivered)
+                # env.release_vc_at(new_pos)
+                # pkt.vc holds (node,port) which the packet currently occupies (or None)
+                env.release_vc_at(pkt.vc if pkt.vc is not None else new_pos)
+                pkt.vc = None
+
+                if pkt in active_packets:
+                    active_packets.remove(pkt)
+                delivered += 1
+                packet_age += pkt.age
+                hops_for_delivered.append(pkt.age)
+
+            # compute reward
+            r, details = compute_reward(prev, new_pos, dst_coord, blocked, neighbor_cong[action], env,
+                                        active_packets, pkt.history)
+
+            # print("reawrd", r)
+            pkt.cum_reward += r
+            episode_reward += r
+            pkt.age += 1
+            pkt.history.add(new_pos)
+
+            # remove aged packets
+            if pkt.age > PACKET_MAX_AGE:
+                # release VC at current position
+                env.release_vc_at(pkt.pos)
+                if pkt in active_packets:
+                    active_packets.remove(pkt)
+                dropped += 1
+                packet_age += pkt.age
+
+        # draw
+        if render:
+            draw_grid(ax, env, active_packets, show_ports=True)
+            plt.pause(delay)
+
+        env.end_timestep()
+        if len(active_packets) == 0:
+            break
+
+    if render:
+        plt.ioff()
+        plt.show()
+
+    # stats['steps'] = step + 1
+    # stats['blocked_frac'] = stats['blocked'] / max(1, stats['attempts'])
+    # return stats
+
+
+
 # -------------------------
 # CLI
 # -------------------------
@@ -477,10 +635,15 @@ def main():
                      vc_fault_persistence=5, vc_clear_persistence=3, vc_ema_alpha=0.25,
                      history_scale=50.0)
 
-    res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=False)
-    print("==== Evaluation summary ====")
-    for k, v in res.items():
-        print(f"{k:25s}: {v}")
+    faulty_nodes = [(0, 0), (1,3), (3,4), (2,2)]
+    src = (0,4)
+    dst = (4,1)
+    # res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=False)
+    manual_test_run(q_table, env, src=src, dst=dst, faulty_nodes=faulty_nodes, delay=1, render=True)
+
+    # print("==== Evaluation summary ====")
+    # for k, v in res.items():
+    #     print(f"{k:25s}: {v}")
 
 if __name__ == '__main__':
     main()

@@ -937,17 +937,17 @@ class NetworkEnv:
         avg_hist = total_hist / node_area
         hist_score = float(math.tanh(avg_hist / max(1.0, self.HISTORY_SCALE)))
 
-        active_in_neigh = 0
+        active_in_neigh = -1
         if active_packets is not None:
             for p in active_packets:
                 if abs(p.pos[0] - cx) + abs(p.pos[1] - cy) <= radius:
                     active_in_neigh += 1
 
         active_scale = self.NUM_VCS * 2
-        active_score = float(math.tanh(active_in_neigh / active_scale))
+        active_score = float(math.tanh(active_in_neigh/ active_scale))
         # print(f"Active in Neigh: {active_in_neigh} ")
 
-        W_HIST, W_ACTIVE = 0.1, 0.9
+        W_HIST, W_ACTIVE = 0.0, 1.0
         combined = W_HIST * hist_score + W_ACTIVE * active_score
         # print(f"Hist {hist_score}, Active: {active_score}, Combined: {combined}")
         fault_in_neigh = 0
