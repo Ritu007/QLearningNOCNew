@@ -395,7 +395,7 @@ class Packet:
         # pkt.vc holds the (node, port) where this packet currently occupies a VC
         # on injection we'll set it to (src_node, LOCAL_PORT)
         self.vc = None
-        self.history = set()
+        self.history = []
 
     @property
     def pos(self):
@@ -758,7 +758,7 @@ class NetworkEnv:
         p = Packet(src_idx, dst_idx, self.idx_to_coord)
         # mark packet as occupying source's LOCAL VC
         p.vc = (node, self.LOCAL_PORT)
-        p.history.add(node)
+        p.history.append(node)
         return p
 
     # -----------------------

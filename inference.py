@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle, RegularPolygon
 
 # from train import NUM_NODES
-from new_environment import NetworkEnv, Packet
+from environment import NetworkEnv, Packet
 # from train import blocked
 
 # -------------------------
@@ -142,41 +142,188 @@ def draw_grid(ax, env, active_packets, show_ports=True):
 # -------------------------
 # helpers (same semantics as train.py)
 # -------------------------
+def count_two_hop_faults_quantized(sx, sy, dx, dy, faulty_routers):
+    two_hops_neighbours = [(-1, 1), (0, 2), (1, 1), (2, 0),
+                           (1, -1), (0, -2), (-1, -1), (-2, 0)]
+
+    # raw scores
+    counts = {'right': 0.0, 'left': 0.0, 'down': 0.0, 'up': 0.0}
+
+    delx = dx - sx
+    dely = dy - sy
+
+    # print("del", delx, dely)
+
+    # pick quadrant
+    if delx >= 0 and dely > 0:
+        dir_idx = 0
+        axes = ('right', 'down')
+    elif delx > 0 and dely <= 0:
+        dir_idx = 1
+        axes = ('down', 'left')
+    elif delx <= 0 and dely < 0:
+        dir_idx = 2
+        axes = ('left', 'up')
+    elif delx < 0 and dely >= 0:
+        dir_idx = 3
+        axes = ('up', 'right')
+    else:
+        # dir_idx = 0
+        # print("Here", delx, dely)
+        return 0, 0, 0, 0, 0
+
+    offset = (dir_idx * 2) % 8
+
+    min_x, max_x = min(sx, dx), max(sx, dx)
+    min_y, max_y = min(sy, dy), max(sy, dy)
+
+    for i in range(5):
+        ox, oy = two_hops_neighbours[(i + offset) % 8]
+        nx, ny = sx + ox, sy + oy
+
+        if (nx, ny) in faulty_routers or not (0 <= nx < GRID_H and 0 <= ny < GRID_W):
+            critical = (min_x <= nx <= max_x) and (min_y <= ny <= max_y)
+            weight = 1.0 if critical else 0.25
+
+            if i < 3:
+                counts[axes[0]] += weight
+            if i >= 2:
+                counts[axes[1]] += weight
+
+    # --- quantization step ---
+    def quantize(v):
+        if v >= 1.5:
+            return 2
+        elif v >= 0.5:
+            return 1
+        else:
+            return 0
+
+    return (dir_idx,
+        quantize(counts['right']),
+        quantize(counts['down']),
+        quantize(counts['left']),
+        quantize(counts['up']),
+    )
+
 # -------------------------
 # helpers for state index
 # -------------------------
-def state_index(source, destination, faulty_routers, N=GRID_W):
+def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
     # source/destination: (row, col)
     sx, sy = env.idx_to_coord(source)
     dx, dy = env.idx_to_coord(destination)
     delx = dx - sx
     dely = dy - sy
 
-    # dir mapping: 0=right,1=down,2=left,3=up
-    if dely > 0:
-        dir = 0 if delx >= 0 else 3
-    elif dely == 0:
-        dir = 1 if delx > 0 else 3
-    else:  # dely < 0
-        dir = 1 if delx > 0 else 2
-    # print("dir", dir)
+    prev_action = 0
+    for key, value in env.DELTAS.items():
+        if prev_node is None:
+            break
+        if (sx, sy) == (prev_node[0] + value[0], prev_node[1] + value[1]):
+            prev_action = key
 
+        # neighbors: right, down, left, up
+    deltas = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+    delta_th = [
+        [(0, 2), (1, 1), (2, 0)],
+        [(2, 0), (1, -1), (0, -2)],
+        [(0, -2), (-1, -1), (-2, 0)],
+        [(-2, 0), (-1, 1), (0, 2)]
+    ]
+
+    # dir mapping: 0=right,1=down,2=left,3=up
+    # if dely > 0:
+    #     dir = 0 if delx >= 0 else 3
+    # elif dely == 0:
+    #     dir = 1 if delx > 0 else 3
+    # else:  # dely < 0
+    #     dir = 1 if delx > 0 else 2
+    # print("dir", dir)
+    # offset = (delx, dely)
+    # rel_off = (offset[0] + N - 1, offset[1] + N - 1)
+    # rel_dist = rel_off[0] * (2 * N - 1) + rel_off[1]
+
+    # print(f"Offset: {offset}, Rel_off: {rel_off}, Rel Dist: {rel_dist}")
     hops = np.abs(delx) + np.abs(dely)
+
+    direction, right, down, left, up = count_two_hop_faults_quantized(sx,sy,dx,dy,faulty_routers)
+
+    # print(f"Dir: {direction}, R: {right}, D: {down}, L: {left}, U: {up}")
+
+    two_hop_state = (0,0)
+    one_hop_state = [0,0]
+    one_hop_fault_one, one_hop_fault_two = 0, 0
+    # neigh_right = (sx + deltas[0][0], sy + deltas[0][1])
+    # neigh_down = (sx + deltas[1][0], sy + deltas[1][1])
+    # neigh_left = (sx + deltas[2][0], sy + deltas[2][1])
+    # neigh_up = (sx + deltas[3][0], sy + deltas[3][1])
+
+    two_hop_faults = [right, down, left, up]
+    neighs = []
+    for i in range(4):
+        neighs.append((sx + deltas[i][0], sy + deltas[i][1]))
+
+    one_hop_faults = [0, 0, 0, 0]
+    for i in range(4):
+        if neighs[i] in faulty_routers:
+            one_hop_faults[i] = 1
+            two_hop_faults[i] = 3
+        if not (0 <= neighs[i][0] < GRID_H and 0 <= neighs[i][1] < GRID_W):
+            one_hop_faults[i] = 1
+            two_hop_faults[i] = 3
+
+    two_hop_state = (two_hop_faults[direction % 4], two_hop_faults[(direction + 1) % 4])
+    for i in range(direction + 2, direction + 4):
+        if one_hop_faults[i % 4] == 1:
+            one_hop_state[i % 2] = 1
+
+
+
+    # if direction == 0:
+    #     fault_one, fault_two = right, down
+    #     two_hop_state = (two_hop_faults[direction % 4], two_hop_faults[(direction + 1) % 4])
+    #     for i in range(direction + 2, direction + 4):
+    #         if one_hop_faults[i % 4] == 1:
+    #             one_hop_state[i % 2] = 1
+    #
+    #     if neigh_right in faulty_routers:
+    #         fault_one = 3
+    #     if neigh_down in faulty_routers:
+    #         fault_two = 3
+    # if direction == 1:
+    #     fault_one, fault_two = down, left
+    #
+    #     if neigh_down in faulty_routers:
+    #         fault_one = 3
+    #     if neigh_left in faulty_routers:
+    #         fault_two = 3
+    # if direction == 2:
+    #     fault_one, fault_two = left, up
+    #
+    #     if neigh_left in faulty_routers:
+    #         fault_one = 3
+    #     if neigh_up in faulty_routers:
+    #         fault_two = 3
+    # if direction == 3:
+    #     fault_one, fault_two = up, right
+    #
+    #     if neigh_up in faulty_routers:
+    #         fault_one = 3
+    #     if neigh_right in faulty_routers:
+    #         fault_two = 3
+
 
     if hops <= 1:
         dist = 0
     elif hops == 2:
         dist = 1
-    elif hops > 2:
+    elif 3 <= hops <= 4:
         dist = 2
-    # neighbors: right, down, left, up
-    deltas = [(0,1),(1,0),(0,-1),(-1,0)]
-    delta_th = [
-        [(0,2),(1,1),(2,0)],
-        [(2,0),(1,-1),(0,-2)],
-        [(0,-2),(-1,-1),(-2,0)],
-        [(-2,0),(-1,1),(0,2)]
-    ]
+    else:
+        dist = 3
+
+
 
     faulty_set = set(faulty_routers)
     def is_fault(p):
@@ -187,20 +334,29 @@ def state_index(source, destination, faulty_routers, N=GRID_W):
         return 1 if p in faulty_set else 0
     neigh = []
     bits = 0
-    for off in deltas:
-        bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
-        neigh.append(is_fault((sx + off[0], sy + off[1])))
-    for off in delta_th[dir]:
-        bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
-        neigh.append(is_fault((sx + off[0], sy + off[1])))
+    # for off in deltas:
+    #     bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+    #     neigh.append(is_fault((sx + off[0], sy + off[1])))
+    # for off in delta_th[dir]:
+    #     bits = (bits << 1) | is_fault((sx + off[0], sy + off[1]))
+    #     neigh.append(is_fault((sx + off[0], sy + off[1])))
     # print("NEigh", neigh)
-    combined = dir * 3 + dist
-    packed = (combined << 7) | bits
 
-    raw_state = [combined]
-    raw_state.append(neigh)
+    for fault in one_hop_state:
+        bits = (bits << 1) | fault
+        # neigh.append(is_fault((sx + off[0], sy + off[1])))
+
+    state = [prev_action, direction, dist, two_hop_state, one_hop_state]
+    state.extend(neigh)
+    combined = (((prev_action * 4 + direction) * 4 + dist) * 4 + two_hop_state[0]) * 4 + two_hop_state[1]
+    packed = (combined << 2) | bits
+
+    # combined = direction
+    # state = [rel_dist]
+    # print(f'Faults: {faulty_routers}, One hop: {one_hop_faults}, State_one: {one_hop_state}, Two Hop: {two_hop_faults}, State Two: {two_hop_state}')
+    # print(f"Source: {(sx, sy)}, Destination: {(dx, dy)}, Prev: {prev_node}, Prev Action: {prev_action}, State: {state}, Index: {packed}")
     # optional: return components for debugging
-    return raw_state, packed  # or return dir, bits, packed
+    return packed  # or return dir, bits, packed
 
 # -------------------------
 # reward function (wraps env methods)
@@ -324,7 +480,7 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
         avoid_nodes = {s_coord, d_coord}
 
         # generate faults (env will store them)
-        env.generate_random_faults(max_node_faults=4, max_link_faults=0, avoid_nodes=avoid_nodes)
+        env.generate_random_faults(max_node_faults=5, max_link_faults=0, avoid_nodes=avoid_nodes)
 
         # inject initial packet if VC available
         p0 = env.try_inject(s, d)
@@ -386,7 +542,9 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                 faulty_nodes = env.faulty_at_start(prev, neighbor_cong)
                 # print("faulty sustained", faulty_nodes)
                 # build state index
-                state, s_idx = state_index(env.coord_to_idx(prev[0], prev[1]), pkt.dst_idx, faulty_nodes, N=GRID_W)
+                last_node = pkt.history[-2] if len(pkt.history) > 1 else None
+
+                s_idx = state_index(env.coord_to_idx(prev[0], prev[1]), pkt.dst_idx, last_node, faulty_nodes, N=GRID_W)
 
                 # select action (epsilon-greedy)
 
@@ -425,7 +583,7 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
                 pkt.cum_reward += r
                 episode_reward += r
                 pkt.age += 1
-                pkt.history.add(new_pos)
+                pkt.history.append(new_pos)
 
 
                 # remove aged packets
@@ -608,7 +766,7 @@ def manual_test_run(q_table, env, src, dst, faulty_nodes=None, faulty_links=None
             pkt.cum_reward += r
             episode_reward += r
             pkt.age += 1
-            pkt.history.add(new_pos)
+            pkt.history.append(new_pos)
 
             # remove aged packets
             if pkt.age > PACKET_MAX_AGE:
@@ -644,8 +802,8 @@ def manual_test_run(q_table, env, src, dst, faulty_nodes=None, faulty_links=None
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--qtable', type=str, required=True, help='Path to qtable pickle file saved from training')
-    p.add_argument('--episodes', type=int, default=400, help='Number of evaluation episodes')
-    p.add_argument('--max-timesteps', type=int, default=400, help='Max timesteps per episode')
+    p.add_argument('--episodes', type=int, default=1000, help='Number of evaluation episodes')
+    p.add_argument('--max-timesteps', type=int, default=500, help='Max timesteps per episode')
     p.add_argument('--seed', type=int, default=0, help='Random seed')
     args = p.parse_args()
 
@@ -665,7 +823,7 @@ def main():
     dst = (4,1)
     res = evaluate(q_table, env, episodes=args.episodes, max_timesteps=args.max_timesteps, seed=args.seed, render=False)
     # manual_test_run(q_table, env, src=src, dst=dst, faulty_nodes=faulty_nodes, delay=1, render=True)
-
+    #
     print("==== Evaluation summary ====")
     for k, v in res.items():
         print(f"{k:25s}: {v}")
