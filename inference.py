@@ -8,7 +8,9 @@ from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle, RegularPolygon
-
+import math
+# from train import DISCOUNT
+from utils import draw_grid
 # from train import NUM_NODES
 from environment import NetworkEnv, Packet
 # from train import blocked
@@ -20,11 +22,12 @@ GRID_W = GRID_H = 5
 NUM_VCS = 4
 NUM_ACTIONS = 5
 NUM_NODES = GRID_H * GRID_W
-MAX_TIMESTEPS = 400
+MAX_TIMESTEPS = 1000
+MAX_FAULTS = 5
 
-MAX_ACTIVE_PACKETS = 1
+MAX_ACTIVE_PACKETS = 20
 PACKET_INJECTION_PROB = 1
-PACKET_MAX_AGE = 40
+PACKET_MAX_AGE = 60
 
 # reward hyperparams (keep in sync with env if changed)
 MOVE_PENALTY = 1
@@ -47,6 +50,9 @@ W_DEL = 2
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
 R_MAX = 1000.0
+DISCOUNT = 0.95
+
+
 
 
 # instantiate environment
@@ -55,93 +61,42 @@ env = NetworkEnv(grid_w=GRID_W, grid_h=GRID_H, num_vcs=NUM_VCS,
                  history_scale=50.0)
 
 
-# -------------------------
-# drawing helpers
-# -------------------------
-NODE_BG = "#efefef"
-NODE_FAULTY_BG = "#d9534f"   # red-ish
-NODE_SUSTAIN_BG = "#f0ad4e"  # orange
-NODE_BORDER = "#444444"
-PACKET_COLORS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
-]
-
-PORT_MARKER_SIZE = 0.12  # fraction of cell
-
-def draw_grid(ax, env, active_packets, show_ports=True):
-    ax.clear()
-    ax.set_aspect('equal')
-    ax.set_xlim(0, env.GRID_W)
-    ax.set_ylim(0, env.GRID_H)
-    ax.invert_yaxis()  # so (0,0) is top-left like your coordinate system
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    # draw cells
-    for r in range(env.GRID_H):
-        for c in range(env.GRID_W):
-            node = (r, c)
-            # base color
-            face = NODE_BG
-            if node in env.faulty_nodes:
-                face = NODE_FAULTY_BG
-            # if any sustained port exists at this node, slightly orange tinted
-            node_has_sustained = any(((node, p) in env.sustained_faulty_ports) for p in [0,1,2,3,env.LOCAL_PORT])
-            if node_has_sustained and (node not in env.faulty_nodes):
-                face = NODE_SUSTAIN_BG
-
-            rect = Rectangle((c, r), 1, 1, facecolor=face, edgecolor=NODE_BORDER)
-            ax.add_patch(rect)
-
-    # show port markers (triangles) for sustained ports
-    if show_ports:
-        for ((nr, nc), port) in env.sustained_faulty_ports:
-            if not env.in_bounds(nr, nc):
-                continue
-            # compute triangle position inside cell according to port: 0=UP,1=RIGHT,2=DOWN,3=LEFT
-            cx = nc + 0.5
-            cy = nr + 0.5
-            offset = 0.35
-            if port == 3:  # UP - triangle pointing up
-                tri = RegularPolygon((cx, cy - offset), numVertices=3, radius=0.15, orientation=0)
-            elif port == 0:  # RIGHT
-                tri = RegularPolygon((cx + offset, cy), numVertices=3, radius=0.15, orientation=0.5 * np.pi)
-            elif port == 1:  # DOWN
-                tri = RegularPolygon((cx, cy + offset), numVertices=3, radius=0.15, orientation=np.pi)
-            elif port == 2:  # LEFT
-                tri = RegularPolygon((cx - offset, cy), numVertices=3, radius=0.15, orientation=1.5 * np.pi)
-            else:  # local
-                tri = Circle((cx, cy), 0.08)
-            tri.set_facecolor("#7f0000")
-            tri.set_edgecolor("k")
-            ax.add_patch(tri)
-
-    # draw packets
-    for i, pkt in enumerate(active_packets):
-        px, py = pkt.pos  # (row,col)
-        cx = py + 0.5
-        cy = px + 0.5
-        color = PACKET_COLORS[i % len(PACKET_COLORS)]
-        circle = Circle((cx, cy), 0.25, color=color, zorder=4)
-        ax.add_patch(circle)
-        ax.text(cx, cy, (pkt.dst_idx, pkt.age), color="white", weight="bold", ha="center", va="center", zorder=5, fontsize=8)
-
-    # draw destinations as small black squares (if any active packets)
-    for pkt in active_packets:
-        dx, dy = env.idx_to_coord(pkt.dst_idx)
-        cx = dy + 0.5
-        cy = dx + 0.5
-        dest_rect = Rectangle((cx - 0.12, cy - 0.12), 0.24, 0.24, facecolor="#000000", zorder=3)
-        ax.add_patch(dest_rect)
-
-    ax.set_title(f"Packets: {len(active_packets)} | Sustained ports: {len(env.sustained_faulty_ports)} | Faulty nodes: {len(env.faulty_nodes)}")
-    return ax
 
 
 # -------------------------
 # helpers (same semantics as train.py)
 # -------------------------
+
+def check_path_availability(node):
+    nx, ny = node
+    fault_count = 0
+    for i in range(4):
+        neigh = (nx + env.DELTAS[i][0], ny + env.DELTAS[i][1])
+        if neigh in env.faulty_nodes or not (0 <= neigh[0] < GRID_H and 0 <= neigh[1] < GRID_W):
+            fault_count += 1
+    if fault_count == 4:
+        return False
+    return True
+
+
+def age_penalty(age, t_min=7, t_rise=10, t_mid=15.0, k=0.59):
+    """
+    Smooth age penalty in [0,1]:
+      - minimal for age <= t_min (kept tiny)
+      - starts rising around t_rise
+      - midpoint (50%) at t_mid
+      - steepness controlled by k (higher k => sharper rise)
+    Returns a float in [0,1].
+    """
+    # logistic (sigmoid) core
+    s = 1.0 / (1.0 + math.exp(-k * (age - t_mid)))
+    if age <= t_min:
+        # scale down to keep minimal penalty for small ages (continuous)
+        scale = (age / float(t_min)) * 0.25  # tweak 0.25 to set how "minimal" it stays
+        return s * scale
+    return s
+
+
 def count_two_hop_faults_quantized(sx, sy, dx, dy, faulty_routers):
     two_hops_neighbours = [(-1, 1), (0, 2), (1, 1), (2, 0),
                            (1, -1), (0, -2), (-1, -1), (-2, 0)]
@@ -173,22 +128,40 @@ def count_two_hop_faults_quantized(sx, sy, dx, dy, faulty_routers):
         return 0, 0, 0, 0, 0
 
     offset = (dir_idx * 2) % 8
-
+    ports = [[1,2,3],[2,3,0],[3,0,1],[0,1,2]]
     min_x, max_x = min(sx, dx), max(sx, dx)
     min_y, max_y = min(sy, dy), max(sy, dy)
-
-    for i in range(5):
-        ox, oy = two_hops_neighbours[(i + offset) % 8]
+    neigh_index = 0
+    port = []
+    port.extend(ports[dir_idx % 4])
+    port.extend(ports[(dir_idx + 1) % 4])
+    # print("Ports", dir_idx, port)
+    for port_index in range(6):
+        weight = 0.0
+        ox, oy = two_hops_neighbours[(neigh_index + offset) % 8]
         nx, ny = sx + ox, sy + oy
 
-        if (nx, ny) in faulty_routers or not (0 <= nx < GRID_H and 0 <= ny < GRID_W):
+
+
+        if (nx, ny) in faulty_routers or not (0 <= nx < GRID_H and 0 <= ny < GRID_W) or ((nx, ny), port[port_index]) in env.sustained_faulty_ports:
             critical = (min_x <= nx <= max_x) and (min_y <= ny <= max_y)
             weight = 1.0 if critical else 0.25
 
-            if i < 3:
+        # if ((nx, ny), port[port_index]) in env.sustained_faulty_ports:
+        #     critical = (min_x <= nx <= max_x) and (min_y <= ny <= max_y)
+        #     weight = 1.0 if critical else 0.25
+
+            if port_index < 3:
                 counts[axes[0]] += weight
-            if i >= 2:
+            if neigh_index >= 3:
                 counts[axes[1]] += weight
+
+        # print("Neigh", (nx, ny), port[port_index], weight)
+        # print("Axis 0:", counts[axes[0]], "Axis 1:", counts[axes[1]])
+
+        if not (port_index == 2 and neigh_index == 2):
+            neigh_index += 1
+
 
     # --- quantization step ---
     def quantize(v):
@@ -253,11 +226,6 @@ def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
 
     two_hop_state = (0,0)
     one_hop_state = [0,0]
-    one_hop_fault_one, one_hop_fault_two = 0, 0
-    # neigh_right = (sx + deltas[0][0], sy + deltas[0][1])
-    # neigh_down = (sx + deltas[1][0], sy + deltas[1][1])
-    # neigh_left = (sx + deltas[2][0], sy + deltas[2][1])
-    # neigh_up = (sx + deltas[3][0], sy + deltas[3][1])
 
     two_hop_faults = [right, down, left, up]
     neighs = []
@@ -266,7 +234,8 @@ def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
 
     one_hop_faults = [0, 0, 0, 0]
     for i in range(4):
-        if neighs[i] in faulty_routers:
+        opp_port = (i + 2) % 4
+        if neighs[i] in faulty_routers or (neighs[i], opp_port) in env.sustained_faulty_ports:
             one_hop_faults[i] = 1
             two_hop_faults[i] = 3
         if not (0 <= neighs[i][0] < GRID_H and 0 <= neighs[i][1] < GRID_W):
@@ -278,42 +247,6 @@ def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
         if one_hop_faults[i % 4] == 1:
             one_hop_state[i % 2] = 1
 
-
-
-    # if direction == 0:
-    #     fault_one, fault_two = right, down
-    #     two_hop_state = (two_hop_faults[direction % 4], two_hop_faults[(direction + 1) % 4])
-    #     for i in range(direction + 2, direction + 4):
-    #         if one_hop_faults[i % 4] == 1:
-    #             one_hop_state[i % 2] = 1
-    #
-    #     if neigh_right in faulty_routers:
-    #         fault_one = 3
-    #     if neigh_down in faulty_routers:
-    #         fault_two = 3
-    # if direction == 1:
-    #     fault_one, fault_two = down, left
-    #
-    #     if neigh_down in faulty_routers:
-    #         fault_one = 3
-    #     if neigh_left in faulty_routers:
-    #         fault_two = 3
-    # if direction == 2:
-    #     fault_one, fault_two = left, up
-    #
-    #     if neigh_left in faulty_routers:
-    #         fault_one = 3
-    #     if neigh_up in faulty_routers:
-    #         fault_two = 3
-    # if direction == 3:
-    #     fault_one, fault_two = up, right
-    #
-    #     if neigh_up in faulty_routers:
-    #         fault_one = 3
-    #     if neigh_right in faulty_routers:
-    #         fault_two = 3
-
-
     if hops <= 1:
         dist = 0
     elif hops == 2:
@@ -322,8 +255,6 @@ def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
         dist = 2
     else:
         dist = 3
-
-
 
     faulty_set = set(faulty_routers)
     def is_fault(p):
@@ -390,19 +321,25 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
     new_d = abs(new_pos[0] - dst_pos[0]) + abs(new_pos[1] - dst_pos[1])
     progress = prev_d - new_d
     max_grid_dist = (GRID_W - 1) + (GRID_H - 1)
+
+    phi_p = - prev_d
+    phi_n = - new_d
+
+    shaping = DISCOUNT * phi_n - phi_p
     # if progress > 0:
     #     progress *= 3
-    details['R_dir'] = W_DIR * (progress)
 
-    # print(f"Progress: {progress}, R Dir: {details['R_dir']}")
+    details['R_dir'] = W_DIR * (progress + shaping)
+
+    # print(f"Progress: {progress}, R Dir: {details['R_dir']}, R Move: {details['R_move']}, Total: {details['R_dir'] + details['R_move']}")
 
     details['R_busy_link'] = -W_NEIGH_CONG * BUSY_LINK_PENALTY if blocked['busy_link'] else 0.0
     details['R_no_vc'] = -W_NEIGH_CONG * BUSY_LINK_PENALTY if blocked['no_vc'] else 0.0
     details['R_oob'] = - W_FAULT * FAULT_PENALTY if blocked['oob'] else 0.0
 
     # print(f"Busy Link: {details['R_busy_link']}, No VC: {details['R_no_vc']}, OOB: {details['R_oob']}")
-    # details["R_cong"] = -5.0 if (blocked['sustained'] or cong_level == 3) else 0.0
-    details["R_cong"] = 0.0
+    details["R_cong"] = -W_FAULT * FAULT_PENALTY if (blocked['sustained'] or cong_level == 3) else 0.0
+    # details["R_cong"] = 0.0
     # fault penalty
     details['R_fault'] = -W_FAULT * FAULT_PENALTY if (blocked['faulty']) else 0.0
     # print(f"Cong: {details['R_cong']}, Fault: {details['R_fault']}")
@@ -417,8 +354,13 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
     # print(f"Neigh Fault: {neigh_fault_score}")
     # print("R_neigh", details['R_neigh'])
     # print("R_neigh_fault", details['R_neigh_fault'])
-    if age >= PACKET_MAX_AGE:
-        details['R_age'] = W_AGE * DROP_PENALTY
+
+    age_pen = age_penalty(age)
+
+    if age > PACKET_MAX_AGE:
+        age_pen *= 5
+    details['R_age'] = W_AGE * age_pen * DROP_PENALTY
+    # print(f"Age: {age}, Pen: {age_pen}, R_Age: {details['R_age']}")
     # dest reward
     details['R_dest'] = W_DEL * DEST_REWARD if new_pos == dst_pos else 0.0
 
@@ -434,6 +376,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
 
     # print("R_total", details)
     return total, details
+
 
 # -------------------------
 # Inference / evaluation loop
@@ -474,13 +417,24 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
         d = random.randrange(NUM_NODES)
         while d == s:
             d = random.randrange(NUM_NODES)
+
+            s_path_avail = check_path_availability(env.idx_to_coord(s))
+            d_path_avail = check_path_availability(env.idx_to_coord(d))
+
+            while not s_path_avail:
+                s = random.randrange(NUM_NODES)
+                s_path_avail = check_path_availability(env.idx_to_coord(s))
+            while not d_path_avail:
+                d = random.randrange(NUM_NODES)
+                d_path_avail = check_path_availability(env.idx_to_coord(d))
+
         # ensure avoid when generating faults
         s_coord = env.idx_to_coord(s)
         d_coord = env.idx_to_coord(d)
         avoid_nodes = {s_coord, d_coord}
 
         # generate faults (env will store them)
-        env.generate_random_faults(max_node_faults=5, max_link_faults=0, avoid_nodes=avoid_nodes)
+        env.generate_random_faults(max_node_faults=MAX_FAULTS, max_link_faults=0, avoid_nodes=avoid_nodes)
 
         # inject initial packet if VC available
         p0 = env.try_inject(s, d)
@@ -623,7 +577,7 @@ def evaluate(q_table, env, episodes=100, max_timesteps=400, seed=None, render=Fa
     dropped = stats['dropped']
     episodes = stats['episodes']
     avg_reward = stats['total_reward'] / max(1, episodes)
-    delivered_rate = delivered / max(1, injected)
+    delivered_rate = delivered / max(1, delivered + dropped)
     avg_steps = stats['total_steps'] / max(1, episodes)
     blocked_frac = stats['blocked_attempts'] / max(1, stats['total_attempts'])
     avg_hops = np.mean(stats['avg_hops']) if stats['avg_hops'] else float('nan')

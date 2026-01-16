@@ -485,7 +485,7 @@ class NetworkEnv:
         self.NODES = set()
 
         for node in range(self.NUM_NODES):
-            self.NODES.add(Node(node, self.idx_to_coord))
+            self.NODES.add(node)
 
         # runtime counters / state
         self.reset_counters()
@@ -562,7 +562,7 @@ class NetworkEnv:
         self.faulty_links = set(faulty_links) if faulty_links else set()
 
     def generate_random_faults(self, max_node_faults=2, max_link_faults=0, avoid_nodes=None):
-        all_nodes = [(node.x, node.y) for node in self.NODES]
+        all_nodes = [self.idx_to_coord(node) for node in self.NODES]
         if avoid_nodes:
             all_nodes = [n for n in all_nodes if n not in avoid_nodes]
         node_fault_count = random.randint(0, max_node_faults)
@@ -681,15 +681,15 @@ class NetworkEnv:
         self.vc_reserved.clear()
         self.occupied_links.clear()
 
-        for node in range(nodes):
+        for node in nodes:
             # node = (r, c)
             # iterate ports (0..3) + LOCAL_PORT if used
             for port in [0, 1, 2, 3, self.LOCAL_PORT]:
-                key = (node, port)
+                key = (self.idx_to_coord(node), port)
                 avail = self.vc_free.get(key, 0)  # current free VCs (0..NUM_VCS)
                 # occupancy fraction: fraction of used VCs
                 occ_frac = float(max(0, self.NUM_VCS - avail)) / float(max(1, self.NUM_VCS))
-                print(f"Node: {node, port}, Avail: {avail}")
+                # print(f"Node: {node, port}, Avail: {avail}")
                 st = self.vc_state[key]
                 # EMA update
                 prev_ema = st['ema']

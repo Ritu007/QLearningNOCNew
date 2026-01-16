@@ -4,14 +4,15 @@ import random
 import time
 import pickle
 from collections import defaultdict
-
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Rectangle, RegularPolygon
 # from fault_training import faulty_nodes
 from environment import NetworkEnv, Packet
 
 # -------------------------
 # Training & env hyperparams
 # -------------------------
-GRID_W = GRID_H = 5
+GRID_W = GRID_H = 16
 NUM_VCS = 4
 
 # instantiate environment
@@ -27,33 +28,46 @@ NC = 4
 ND = 4
 NX = GRID_H  # rows
 NY = GRID_W  # cols
-NUM_FAULTY = 4
+MAX_FAULTS = 50
+render = False
+
 
 # NUM_STATES = (NX * NY) * NUM_NODES * NC * ND  # current node (row,col) x destination x cong x dir
 
 NUM_STATES = NUM_ACTIONS * 4 * 4 * 4**2 * 2**2
 
-# Q-table
-q_table = np.random.uniform(-1, 0, size=(NUM_STATES, NUM_ACTIONS)).astype(np.float32)
-print(f"Q-table shape: {q_table.shape}, bytes: {q_table.nbytes} (~{q_table.nbytes/1024:.1f} KB)")
+qtable = "qtable_grid5x5_vcs4_1768334084.pkl"
+# load q-table
+if qtable is not None:
+    with open(qtable, 'rb') as f:
+        q_table = pickle.load(f)
+
+else:
+    # Q-table
+    q_table = np.random.uniform(-1, 0, size=(NUM_STATES, NUM_ACTIONS)).astype(np.float32)
+    print(f"Q-table shape: {q_table.shape}, bytes: {q_table.nbytes} (~{q_table.nbytes/1024:.1f} KB)")
 
 # RL hyperparams
 HM_EPISODES = 100001
 # EXPLORATION_EPISOPES = 5000
-MAX_TIMESTEPS = 500
+MAX_TIMESTEPS = 1000
 
 LEARNING_RATE = 0.1
 DISCOUNT = 0.95
 
-EPSILON = 0.95
-EPS_DECAY = 0.99995
+EPSILON = 0.8
+EPS_DECAY = 0.99997
 EPS_MIN = 0.1
 
+INJECTION_RATE = 0.02
+
 # multi-packet params
+# MAX_ACTIVE_PACKETS = int(INJECTION_RATE * (NUM_NODES ** 2))
 MAX_ACTIVE_PACKETS = 1
 PACKET_INJECTION_PROB = 1
-PACKET_MAX_AGE = 200
+PACKET_MAX_AGE = 300
 
+print(MAX_ACTIVE_PACKETS)
 # reward hyperparams (keep in sync with env if changed)
 MOVE_PENALTY = 1
 REVISIT_PENALTY = 1
@@ -66,6 +80,7 @@ DROP_PENALTY = 1
 W_MOVE = 0.5
 W_DIR = 0.2
 W_FAULT = 1
+W_CONG = 0.5
 W_LOCAL_CONG = 0.0
 W_NEIGH_CONG = 0.2
 W_NEIGH_FAULT = 0.0
@@ -74,9 +89,12 @@ W_AGE = 0.5
 W_DEL = 5
 MAX_NODE_VISIT_CAP = 50.0
 MAX_LINK_VISIT_CAP = 50.0
-R_MAX = 1000.0
+R_MAX = 20.0
+
 
 import math
+from utils import draw_grid
+
 
 def age_penalty(age, t_min=7, t_rise=10, t_mid=15.0, k=0.59):
     """
@@ -126,22 +144,40 @@ def count_two_hop_faults_quantized(sx, sy, dx, dy, faulty_routers):
         return 0, 0, 0, 0, 0
 
     offset = (dir_idx * 2) % 8
-
+    ports = [[1,2,3],[2,3,0],[3,0,1],[0,1,2]]
     min_x, max_x = min(sx, dx), max(sx, dx)
     min_y, max_y = min(sy, dy), max(sy, dy)
-
-    for i in range(5):
-        ox, oy = two_hops_neighbours[(i + offset) % 8]
+    neigh_index = 0
+    port = []
+    port.extend(ports[dir_idx % 4])
+    port.extend(ports[(dir_idx + 1) % 4])
+    # print("Ports", dir_idx, port)
+    for port_index in range(6):
+        weight = 0.0
+        ox, oy = two_hops_neighbours[(neigh_index + offset) % 8]
         nx, ny = sx + ox, sy + oy
 
-        if (nx, ny) in faulty_routers or not (0 <= nx < GRID_H and 0 <= ny < GRID_W):
+
+
+        if (nx, ny) in faulty_routers or not (0 <= nx < GRID_H and 0 <= ny < GRID_W) or ((nx, ny), port[port_index]) in env.sustained_faulty_ports:
             critical = (min_x <= nx <= max_x) and (min_y <= ny <= max_y)
             weight = 1.0 if critical else 0.25
 
-            if i < 3:
+        # if ((nx, ny), port[port_index]) in env.sustained_faulty_ports:
+        #     critical = (min_x <= nx <= max_x) and (min_y <= ny <= max_y)
+        #     weight = 1.0 if critical else 0.25
+
+            if port_index < 3:
                 counts[axes[0]] += weight
-            if i >= 2:
+            if neigh_index >= 3:
                 counts[axes[1]] += weight
+
+        # print("Neigh", (nx, ny), port[port_index], weight)
+        # print("Axis 0:", counts[axes[0]], "Axis 1:", counts[axes[1]])
+
+        if not (port_index == 2 and neigh_index == 2):
+            neigh_index += 1
+
 
     # --- quantization step ---
     def quantize(v):
@@ -214,7 +250,8 @@ def state_index(source, destination, prev_node, faulty_routers, N=GRID_W):
 
     one_hop_faults = [0, 0, 0, 0]
     for i in range(4):
-        if neighs[i] in faulty_routers:
+        opp_port = (i + 2) % 4
+        if neighs[i] in faulty_routers or (neighs[i], opp_port) in env.sustained_faulty_ports:
             one_hop_faults[i] = 1
             two_hop_faults[i] = 3
         if not (0 <= neighs[i][0] < GRID_H and 0 <= neighs[i][1] < GRID_W):
@@ -310,15 +347,15 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
 
     details['R_dir'] = W_DIR * (progress + shaping)
 
-    # print(f"Progress: {progress}, R Dir: {details['R_dir']}")
+    # print(f"Progress: {progress}, R Dir: {details['R_dir']}, R Move: {details['R_move']}, Total: {details['R_dir'] + details['R_move']}")
 
     details['R_busy_link'] = -W_NEIGH_CONG * BUSY_LINK_PENALTY if blocked['busy_link'] else 0.0
     details['R_no_vc'] = -W_NEIGH_CONG * BUSY_LINK_PENALTY if blocked['no_vc'] else 0.0
     details['R_oob'] = - W_FAULT * FAULT_PENALTY if blocked['oob'] else 0.0
 
     # print(f"Busy Link: {details['R_busy_link']}, No VC: {details['R_no_vc']}, OOB: {details['R_oob']}")
-    # details["R_cong"] = -5.0 if (blocked['sustained'] or cong_level == 3) else 0.0
-    details["R_cong"] = 0.0
+    details["R_cong"] = -W_FAULT * FAULT_PENALTY if (blocked['sustained'] or cong_level == 3) else 0.0
+    # details["R_cong"] = 0.0
     # fault penalty
     details['R_fault'] = -W_FAULT * FAULT_PENALTY if (blocked['faulty']) else 0.0
     # print(f"Cong: {details['R_cong']}, Fault: {details['R_fault']}")
@@ -339,7 +376,7 @@ def compute_reward(prev_pos, new_pos, dst_pos, blocked, cong_level, env_obj, act
     if age > PACKET_MAX_AGE:
         age_pen *= 5
     details['R_age'] = W_AGE * age_pen * DROP_PENALTY
-    print(f"Age: {age}, Pen: {age_pen}, R_Age: {details['R_age']}")
+    # print(f"Age: {age}, Pen: {age_pen}, R_Age: {details['R_age']}")
     # dest reward
     details['R_dest'] = W_DEL * DEST_REWARD if new_pos == dst_pos else 0.0
 
@@ -372,7 +409,8 @@ for episode in range(HM_EPISODES):
     # reset per-episode env counters if desired (vc_free etc.)
     env.reset_counters()
 
-
+    # fig, ax = plt.subplots(figsize=(6, 6))
+    # plt.ion()
     # pick initial seed packet(s)
     active_packets = []
 
@@ -393,7 +431,7 @@ for episode in range(HM_EPISODES):
     avoid_nodes = {s_coord, d_coord}
 
     # generate faults (env will store them)
-    env.generate_random_faults(max_node_faults=5, max_link_faults=0, avoid_nodes=avoid_nodes)
+    env.generate_random_faults(max_node_faults=MAX_FAULTS, max_link_faults=0, avoid_nodes=avoid_nodes)
 
     # print("Fault", env.faulty_nodes)
 
@@ -439,6 +477,7 @@ for episode in range(HM_EPISODES):
         random.shuffle(active_packets)
 
         for pkt in list(active_packets):
+            # env.update_node_status(env.NODES)
             if pkt.done:
                 if pkt in active_packets:
                     active_packets.remove(pkt)
@@ -450,6 +489,8 @@ for episode in range(HM_EPISODES):
             # compute cong & dir at current node (features)
             neighbor_cong = env.compute_cong_dir_at(prev, active_packets=active_packets)
             faulty_nodes = env.faulty_at_start(prev, neighbor_cong)
+            # print("Current Node:", prev,"Congestion", neighbor_cong)
+            # print("faulty", faulty_nodes)
 
             last_node = pkt.history[-2] if len(pkt.history) > 1 else None
             # build state index
@@ -512,13 +553,18 @@ for episode in range(HM_EPISODES):
             new_q = (1 - LEARNING_RATE) * current_q + LEARNING_RATE * target
             q_table[s_idx, action] = new_q
 
-
-
+        # draw
+        # draw_grid(ax, env, active_packets, show_ports=True)
+        # plt.pause(1)
         # end of timestep housekeeping
         env.end_timestep()
         episode_reward = episode_reward/max(1, injected)
     for packet in active_packets:
         packet_age += packet.age
+
+    # if render:
+    #     plt.ioff()
+    #     plt.show()
     # epsilon decay
     if episode > 10 and EPSILON > EPS_MIN:
         EPSILON *= EPS_DECAY
@@ -544,8 +590,14 @@ for episode in range(HM_EPISODES):
         if env.link_visit_count[k] < 1e-3:
             del env.link_visit_count[k]
 
-    if episode >= 20000 and episode % 10000 == 0:
+    if episode >= 20000 and episode % 5000 == 0:
         LEARNING_RATE = LEARNING_RATE * 0.5
+    # if episode >= 5000 and episode % 5000 == 0:
+    #     if INJECTION_RATE <= 0.2:
+    #         INJECTION_RATE += 0.01
+    # if episode >= 10000 and episode % 5000 == 0:
+    #     if MAX_FAULTS < NUM_NODES/2:
+    #         MAX_FAULTS += 1
 
     if episode % 200 == 0:
         recent = np.mean(episode_rewards[-200:]) if len(episode_rewards) >= 200 else np.mean(episode_rewards)
@@ -560,7 +612,7 @@ for episode in range(HM_EPISODES):
             f"Dropped: {recent_avg_drp:.1f}, Active: {recent_avg_undel:.1f}, Avg Packet Age: {recent_avg_age:.1f}")
 
 # Save Q-table
-    if episode >= 10000 and episode % 5000 == 0:
+    if episode >= 20000 and episode % 5000 == 0:
         with open(f"qtable_grid{GRID_W}x{GRID_H}_vcs{NUM_VCS}_{int(time.time())}.pkl", "wb") as f:
             pickle.dump(q_table, f)
 
